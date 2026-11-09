@@ -2383,6 +2383,12 @@ def scan_blob(d, label, out, depth=0, left=None):
     if NEEDLE in d: out.extend(needle_shaders(d, label))
     if SUMO_NX in d or NVNSH in d: out.extend(sumo_shaders(d, label))
 
+def rel_label(path, root):
+    """A file's label: its path under the RomFS root with '/' separators, as the Mac writes it, also on Windows (where relpath writes backslashes, so the profile's
+    shader_groups like /Effect/ matched nothing and every shader went into the 'other' packages). Files are sorted by it, which on the Mac is the order of their full
+    paths (one common prefix) and keeps the packages' indices the same on Windows, where '\\' sorts after the capital letters and '/' before them"""
+    return os.path.relpath(path, root).replace(os.sep, '/')
+
 def group(label):
     """source group (second half of the package file name)"""
     if label.startswith('main'): return 'main'
@@ -2708,7 +2714,7 @@ def main():
     files, results, common = [], [], None
     for i, (romfs, mainnso) in enumerate(zip(romfs_v, main_v)):
         tag = os.path.basename(os.path.dirname(os.path.abspath(romfs))) if i else ''
-        files += sorted((os.path.join(dp, f), (tag + '/' if tag else '') + os.path.relpath(os.path.join(dp, f), romfs)) for dp, _, fs in os.walk(romfs) for f in fs)
+        files += sorted(((os.path.join(dp, f), (tag + '/' if tag else '') + rel_label(os.path.join(dp, f), romfs)) for dp, _, fs in os.walk(romfs) for f in fs), key=lambda t: t[1])
         img = nso_image(mainnso)
         if not i:
             import unityfs
@@ -2735,7 +2741,7 @@ def main():
     for romfs in dlc_v:
         name = os.path.basename(os.path.normpath(romfs))
         tag = 'aoc/' + (name.removesuffix('.img') if is_image(romfs) else name)
-        files += sorted((os.path.join(dp, f), tag + '/' + os.path.relpath(os.path.join(dp, f), romfs)) for dp, _, fs in os.walk(romfs) for f in fs)
+        files += sorted(((os.path.join(dp, f), tag + '/' + rel_label(os.path.join(dp, f), romfs)) for dp, _, fs in os.walk(romfs) for f in fs), key=lambda t: t[1])
     zdicts = {k: v for r in romfs_v + dlc_v for k, v in zs_dicts(r).items()}   # Tears of the Kingdom's zstd dictionaries (zs_dicts)
     keys = {}
     # First pass: every file; Unity bundles carry type trees, and the Shader trees are collected on the way. Second pass: Unity serialized files without type trees are scanned again with the borrowed trees

@@ -11,7 +11,13 @@ def STUR(t, n, off): return 0xF8000000 | ((off & 0x1FF) << 12) | (n << 5) | t   
 def LDUR(t, n, off): return 0xF8400000 | ((off & 0x1FF) << 12) | (n << 5) | t   # ldur xt,[xn,#off]
 def LDRX(t, n, imm12=0): return 0xF9400000 | (imm12 << 10) | (n << 5) | t
 def STRX(t, n, imm12=0): return 0xF9000000 | (imm12 << 10) | (n << 5) | t
-def MRS_TPIDRRO(t): return 0xD53BD060 | t
+# The register rewritten code reads its thread slots' base from (patch_nso.py K18 / KTLS / KTLR / KGATE): tpidrro_el0 on Apple, the pthread TSD base, where a
+# slot is 8 × its key; tpidr_el0 on Android (DM_TARGET=android), the thread pointer, where the slots are the host's local-exec thread-locals (dm/host/loader.c).
+# Linux keeps tpidrro_el0 zero for a 64-bit process, so the Apple form cannot run there. Only the rewriter's own stubs use this: the game's tpidr_el0 / tpidrro_el0
+# accesses are found in the original code and turned into slot accesses either way
+import os as _os
+SLOT_BASE_TPIDR = _os.environ.get('DM_TARGET') == 'android'
+def MRS_TPIDRRO(t): return (0xD53BD040 if SLOT_BASE_TPIDR else 0xD53BD060) | t
 def ADRP(dd, pc, target):
     imm = ((target & ~0xFFF) - (pc & ~0xFFF)) >> 12; assert -(1 << 20) <= imm < (1 << 20)
     return 0x90000000 | ((imm & 3) << 29) | (((imm >> 2) & 0x7FFFF) << 5) | dd

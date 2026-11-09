@@ -16,32 +16,49 @@ int g_nmod;
 // Stable module addresses live in g_mod; lookup order follows activation, including unload/reload.
 static module_t **g_loaded; static int g_nloaded, g_mod_capacity;
 static pthread_rwlock_t g_modules_mu = PTHREAD_RWLOCK_INITIALIZER;
-pthread_key_t g_key18, g_keytls, g_keytlr, g_keygate;
-enum { KEY_K18, KEY_KTLS, KEY_KTLR, KEY_KGATE, KEY_N };
-
 uint64_t resolve_import(module_t *m, const char *name);
 int hle_implements(const char *name);
 void gate_register(uint64_t ret_addr, const char *kind, int arg, uint64_t orig);
 
-static pthread_key_t key_value(unsigned i) {
+#ifdef __APPLE__
+// The slots are pthread keys: Darwin keeps a thread's TSD array at tpidrro_el0, so a key's slot is tpidrro_el0 + 8 × key
+static pthread_key_t g_key18, g_keytls, g_keytlr, g_keygate;
+static pthread_key_t key_of(int i) {
     switch (i) {
     case KEY_K18: return g_key18; case KEY_KTLS: return g_keytls; case KEY_KTLR: return g_keytlr;
     default: return g_keygate;
     }
 }
+void dm_slot_set(int slot, void *v) { pthread_setspecific(key_of(slot), v); }
+void *dm_slot_get(int slot) { return pthread_getspecific(key_of(slot)); }
+static uint64_t slot_offset(unsigned i) { return (uint64_t)key_of((int)i) * 8; }   // the key page entry: the slot's byte offset from the base register
+static uint64_t slot_base(void) { uint64_t base; __asm__ volatile("mrs %0, tpidrro_el0" : "=r"(base)); return base & ~7ull; }
 static void create_keys(void) {
     if (pthread_key_create(&g_key18, NULL) || pthread_key_create(&g_keytls, NULL) ||
         pthread_key_create(&g_keytlr, NULL) || pthread_key_create(&g_keygate, NULL)) die("cannot create the host key");
     LOG("key numbers K18=%lu KTLS=%lu KTLR=%lu KGATE=%lu", g_key18, g_keytls, g_keytlr, g_keygate);
 }
+#else
+// Android: the slots are thread-locals of this executable in the local-exec model, so each sits at the same offset from tpidr_el0 (the thread pointer) in every
+// thread, and the rewriter (DM_TARGET=android, dm/tools/nso_asm.py) reads tpidr_el0 as their base. Linux keeps tpidrro_el0 zero for a 64-bit process
+static __thread void *g_slots[KEY_N] __attribute__((tls_model("local-exec"), aligned(16)));
+void dm_slot_set(int slot, void *v) { g_slots[slot] = v; }
+void *dm_slot_get(int slot) { return g_slots[slot]; }
+static uint64_t slot_base(void) { return (uint64_t)(uintptr_t)__builtin_thread_pointer(); }
+static uint64_t slot_offset(unsigned i) { return (uint64_t)((uintptr_t)&g_slots[i] - (uintptr_t)__builtin_thread_pointer()); }
+static void create_keys(void) {
+    for (unsigned i = 0; i < KEY_N; i++) if (slot_offset(i) % 8 || slot_offset(i) >= (1ull << 31)) die("thread slot %u at offset %#llx from the thread pointer: not usable", i, (unsigned long long)slot_offset(i));
+    LOG("thread slot offsets K18=%#llx KTLS=%#llx KTLR=%#llx KGATE=%#llx", (unsigned long long)slot_offset(KEY_K18), (unsigned long long)slot_offset(KEY_KTLS),
+        (unsigned long long)slot_offset(KEY_KTLR), (unsigned long long)slot_offset(KEY_KGATE));
+}
+#endif
 
-// K slot check: the pthread TSD layout is fixed, slot = tpidrro_el0 + 8*key
+// Slot check: the slot the rewritten code computes (base register + the key page entry) is the one dm_slot_set writes
 static void tsd_check(void) {
-    pthread_setspecific(g_key18, (void *)0x1234);
-    uint64_t base; __asm__ volatile("mrs %0, tpidrro_el0" : "=r"(base));
+    dm_slot_set(KEY_K18, (void *)0x1234);
     uint64_t off = *(uint64_t *)(g_mod[0].base + g_mod[0].key_page_off + g_mod[0].key_idx[KEY_K18] * 8);
-    if (((uint64_t *)(base & ~7ull))[off / 8] != 0x1234) die("TSD layout mismatch");
-    pthread_setspecific(g_key18, 0);
+    if (((uint64_t *)slot_base())[off / 8] != 0x1234) die("thread slot layout mismatch");
+    dm_slot_set(KEY_K18, 0);
 }
 
 static void build_symhash(module_t *m);
@@ -312,7 +329,7 @@ static void install_key_page(module_t *m) {
     if (m->key_page_off + m->key_page_size > m->size) die("%s: key page out of range", m->name);
     uint64_t *page = (uint64_t *)(m->base + m->key_page_off);
     memset(page, 0, m->key_page_size);
-    for (unsigned i = 0; i < KEY_N; i++) page[m->key_idx[i]] = (uint64_t)key_value(i) * 8;
+    for (unsigned i = 0; i < KEY_N; i++) page[m->key_idx[i]] = slot_offset(i);
     for (int k = 0; k < KEY_N; k++) if (!page[m->key_idx[k]]) die("%s: key page entry %d is 0 (host key not created) -- the game would read TSD slot 0", m->name, k);
     if (mprotect(m->base + m->key_page_off, m->key_page_size, PROT_READ)) die("%s key page mprotect", m->name);
     if (m->fps_state_off) install_fps_state(m);
@@ -328,7 +345,7 @@ static void register_gates(module_t *m, const char *dir) {
             if (sscanf(line, "%lx %15s %d %lx", &ret, kind, &arg, &orig) == 4) { gate_register((uint64_t)m->base + ret, kind, arg, orig); ng++; }
         fclose(f);
     }
-    LOG("%s: gates %d patch_off %#llx keys %lu/%lu/%lu/%lu", m->name, ng, m->patch_off, g_key18, g_keytls, g_keytlr, g_keygate);
+    LOG("%s: gates %d patch_off %#llx slot offsets %#llx/%#llx/%#llx/%#llx", m->name, ng, m->patch_off, (unsigned long long)slot_offset(KEY_K18), (unsigned long long)slot_offset(KEY_KTLS), (unsigned long long)slot_offset(KEY_KTLR), (unsigned long long)slot_offset(KEY_KGATE));
 }
 
 // DT_RELR (from SDK 20; all three modules of The Legend of Zelda: Breath of the Wild 1.9.0 have it): a compact table of relative relocations with the addend in the slot (*slot += base).

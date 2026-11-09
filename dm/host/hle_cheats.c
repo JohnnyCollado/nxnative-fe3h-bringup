@@ -61,7 +61,9 @@
 #include <mach/mach_vm.h>    // the alias mapping of main's pages (mach_vm_remap), below; the iPhone SDK has no mach_vm.h
 #include <mach/vm_prot.h>
 #endif
-#include <dispatch/dispatch.h>   // the state files are written off the presenting thread (files_queue)
+#ifdef __APPLE__
+#include <dispatch/dispatch.h>
+#endif   // the state files are written off the presenting thread (files_queue)
 #include <errno.h>
 #include <dirent.h>
 #include <unistd.h>
@@ -1093,12 +1095,18 @@ static void flag_file(char *out, size_t n, const char *what) { snprintf(out, n, 
 // left them. files_drain waits for everything queued: before the engine reads <build>.enabled back (states_load) and at
 // a clean exit, so nothing is lost or read stale. The queue's blocks take no lock of this file: a drain under g_lock
 // cannot deadlock
+#ifdef __APPLE__
 static dispatch_queue_t files_queue(void) {
     static dispatch_queue_t q; static dispatch_once_t once;
     dispatch_once(&once, ^{ q = dispatch_queue_create("nxnative.cheats.files", DISPATCH_QUEUE_SERIAL); });
     return q;
 }
 static void files_drain(void) { dispatch_sync(files_queue(), ^{}); }
+#define FILES_ASYNC(...) dispatch_async(files_queue(), ^{ __VA_ARGS__ })
+#else   // Android: no GCD; the writes run where they are asked, in the same order, so there is nothing to drain
+static void files_drain(void) {}
+#define FILES_ASYNC(...) do { __VA_ARGS__ } while (0)
+#endif
 
 // The safe-mode flag: <dir>/.cheats-running-<title> exists while some cheat runs (a plain cheat on, or the masters while
 // not in safe mode, with the master switch on); a clean exit removes it (dm_cheats_exit), a crash leaves it for the next
@@ -1120,13 +1128,13 @@ static void running_update(void) {
     int want = any && atomic_load(&g_master);
     char *path = strdup(p), *build = strdup(g_build);
     if (!path || !build) { free(path); free(build); return; }
-    dispatch_async(files_queue(), ^{
+    FILES_ASYNC(
         if (!atomic_load(&g_exiting)) {
             if (want) { FILE *f = fopen(path, "w"); if (f) { fprintf(f, "%s\n", build); fclose(f); } }
             else unlink(path);
         }
         free(path); free(build);
-    });
+    );
 }
 
 // Save the enabled states: one key per line, <build>.enabled in the cheats folder (masters are always on, labels never
@@ -1146,7 +1154,7 @@ static void states_save(void) {
         char k[NAME_MAX + 16]; cheat_key(c, k, sizeof k);
         o += (size_t)snprintf(text + o, cap - o, "%s\n", k);
     }
-    dispatch_async(files_queue(), ^{
+    FILES_ASYNC(
         // Written to a temporary beside it and renamed over the old file: fopen("w") truncates first, so an exit (or a
         // crash) in the middle would leave the saved toggles empty; the rename is atomic, the old file stays until then
         char tmp[1500]; snprintf(tmp, sizeof tmp, "%s.tmp", path);
@@ -1155,7 +1163,7 @@ static void states_save(void) {
         else if (fputs(text, f) < 0 || fclose(f)) { LOG("cheats: cannot write %s (errno %d)", tmp, errno); unlink(tmp); }
         else if (rename(tmp, path)) { LOG("cheats: cannot rename %s over %s (errno %d)", tmp, path, errno); unlink(tmp); }
         free(text); free(path);
-    });
+    );
     running_update();
 }
 

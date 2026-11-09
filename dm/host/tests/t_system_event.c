@@ -46,7 +46,8 @@ module_t *g_mod;
 int g_nmod;
 uint64_t g_t0_ns;
 __thread _Atomic int dm_host_work;
-pthread_key_t g_key18;
+void *dm_slot_get(int slot) { (void)slot; return NULL; }   // the thread slots (loader.c): read by hle_thread.c's SVC entry, which does not run here
+void dm_slot_set(int slot, void *v) { (void)slot; (void)v; }
 void crash_thread_init(void) {}
 void guest_thread_init(void) {}
 void guest_thread_set_id(uint64_t id) { (void)id; }

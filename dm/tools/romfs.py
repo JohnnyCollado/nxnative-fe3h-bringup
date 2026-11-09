@@ -93,6 +93,7 @@ def is_image(path):
 
 def _resolve(path):
     p = _os.path.abspath(_os.fsdecode(path))
+    if _os.sep != '/': p = p.replace(_os.sep, '/')   # Windows: abspath writes backslashes, and a path inside the image joins with them; its own API takes '/' as well
     parts = p.split('/')
     for i, part in enumerate(parts):
         if not part.endswith('.img'): continue
@@ -113,9 +114,21 @@ def source(extraction):
 _fd_ranges = {}
 
 
+def _pread(fd, size, offset):
+    """os.pread, which Windows' Python lacks: there a seek and reads on this file's own descriptor (one per _File, never shared)"""
+    if hasattr(_os, 'pread'): return _os.pread(fd, size, offset)
+    _os.lseek(fd, offset, _os.SEEK_SET)
+    out = bytearray()
+    while len(out) < size:
+        b = _os.read(fd, size - len(out))
+        if not b: break
+        out += b
+    return bytes(out)
+
+
 class _File(io.RawIOBase):
     def __init__(self, image, k):
-        self.fd = _os.open(image.path, _os.O_RDONLY)
+        self.fd = _os.open(image.path, _os.O_RDONLY | getattr(_os, 'O_BINARY', 0))   # O_BINARY: Windows opens a descriptor in text mode otherwise
         self.start, self.length = image.entry(k)[:2]
         self.pos = 0
         _fd_ranges[self.fd] = (self.start, self.length)
@@ -129,9 +142,13 @@ class _File(io.RawIOBase):
         self.pos = pos; return pos
     def readinto(self, buffer):
         size = min(len(buffer), max(0, self.length - self.pos))
-        data = _os.pread(self.fd, size, self.start + self.pos)
+        data = _pread(self.fd, size, self.start + self.pos)
         buffer[:len(data)] = data; self.pos += len(data)
         return len(data)
+    def readall(self):   # the rest in one read: RawIOBase's default reads 8 KiB at a time (about 330 reads a file on a 60 KB voice clip, two thirds of a full shader scan's time)
+        data = _pread(self.fd, max(0, self.length - self.pos), self.start + self.pos)
+        self.pos += len(data)
+        return data
     def close(self):
         if not self.closed:
             _fd_ranges.pop(self.fd, None); _os.close(self.fd)

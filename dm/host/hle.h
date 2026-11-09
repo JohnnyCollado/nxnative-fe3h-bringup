@@ -3,10 +3,26 @@
 // such parameters are always declared as int/unsigned and truncated by ourselves. Variadic arguments go on the stack on Apple and in registers on Switch ⇒ variadic functions cannot use C's "..." directly.
 #pragma once
 #include "dm.h"
+// The host's registration tables are sections: Mach-O "__DATA,<name>" read with getsectiondata; on Android (ELF) a section named <name>, whose bounds the linker
+// provides as __start_<name> / __stop_<name> (dm/android/compat/dm_compat.c getsectiondata). Assembly symbol names: Mach-O prefixes C names with an underscore
+// and addresses a page with @PAGE / @PAGEOFF; ELF uses the plain name and :lo12:
+#ifdef __APPLE__
+#define DM_SECTION(name) "__DATA," name
+#define DM_ASM_NAME(n) "_" n
+#define DM_ASM_HIDDEN ".private_extern "
+#define DM_ASM_PAGE(n) "_" n "@PAGE"
+#define DM_ASM_PAGEOFF(n) "_" n "@PAGEOFF"
+#else
+#define DM_SECTION(name) name
+#define DM_ASM_NAME(n) n
+#define DM_ASM_HIDDEN ".hidden "
+#define DM_ASM_PAGE(n) n
+#define DM_ASM_PAGEOFF(n) ":lo12:" n
+#endif
 typedef struct { const char *name; void *fn; } hle_ent;
 #define HLE(mangled, ret, cname, ...)                                                             \
     static ret cname(__VA_ARGS__);                                                                \
-    __attribute__((used, section("__DATA,swhle"))) static const hle_ent hle_ent_##cname = {mangled, (void *)cname}; \
+    __attribute__((used, section(DM_SECTION("swhle")))) static const hle_ent hle_ent_##cname = {mangled, (void *)cname}; \
     static ret cname(__VA_ARGS__)
 
 typedef uint32_t Result;   // nn::Result: w0, 0 = success
@@ -36,16 +52,16 @@ void guest_clock_read_wait(void);     // A guest read of the system counter: wai
 typedef struct { const char *name; void *fn; const char *why; } hle_force_ent;
 #define HLE_FORCE(mangled, why, ret, cname, ...)                                                   \
     static ret cname(__VA_ARGS__);                                                                \
-    __attribute__((used, section("__DATA,swforce"))) static const hle_force_ent hle_force_##cname = {mangled, (void *)cname, why}; \
+    __attribute__((used, section(DM_SECTION("swforce")))) static const hle_force_ent hle_force_##cname = {mangled, (void *)cname, why}; \
     static ret cname(__VA_ARGS__)
 // Same as above, but the implementation runs on this thread's big host stack (hle_bigstack.c): what is registered is a stub generated at compile time (the implementation's address goes into x16, then a jump to dm_bigstack_enter).
 // For take-overs with large stack use (the file system sizes its buffers by PATH_MAX): a game thread's stack can be as small as 8 KB. Only register arguments are carried over (<= 8 integer, <= 8 floating point); not for variadic functions
 #define HLE_FORCE_BIG(mangled, why, ret, cname, ...)                                               \
     static ret cname(__VA_ARGS__) __attribute__((used));                                          \
     extern const char cname##_bs[];                                                               \
-    __asm__(".text\n.p2align 2\n.globl _" #cname "_bs\n.private_extern _" #cname "_bs\n_" #cname "_bs:\n" \
-            "    adrp x16, _" #cname "@PAGE\n    add x16, x16, _" #cname "@PAGEOFF\n    b _dm_bigstack_enter\n"); \
-    __attribute__((used, section("__DATA,swforce"))) static const hle_force_ent hle_force_##cname = {mangled, (void *)(uintptr_t)cname##_bs, why}; \
+    __asm__(".text\n.p2align 2\n.globl " DM_ASM_NAME(#cname "_bs") "\n" DM_ASM_HIDDEN DM_ASM_NAME(#cname "_bs") "\n" DM_ASM_NAME(#cname "_bs") ":\n" \
+            "    adrp x16, " DM_ASM_PAGE(#cname) "\n    add x16, x16, " DM_ASM_PAGEOFF(#cname) "\n    b " DM_ASM_NAME("dm_bigstack_enter") "\n"); \
+    __attribute__((used, section(DM_SECTION("swforce")))) static const hle_force_ent hle_force_##cname = {mangled, (void *)(uintptr_t)cname##_bs, why}; \
     static ret cname(__VA_ARGS__)
 // The game's call site inside a HLE_FORCE_BIG implementation: pass __builtin_return_address(0), which after a stack switch is the entry's own (hle_bigstack.c)
 void *dm_bigstack_caller(void *ra);

@@ -299,11 +299,19 @@ static vpx_image_t *av1_to_i420(const mav1_picture *p) {   // the decoder's NV12
     }
     return c;
 }
+// DM_CODEC_TRACE: each submit, acquire, release and picture-properties call logs the decoder's counts and queues (the first 24 calls of each kind, then every 2^k-th),
+// to see where a movie stops: packets no longer submitted, pictures not decoded, or buffers no longer released
+static int cv_trace(_Atomic uint64_t *n) {
+    static int on = -1; if (on < 0) on = getenv("DM_CODEC_TRACE") != NULL;
+    if (!on) return 0;
+    uint64_t k = ++*n; return k <= 24 || !(k & (k - 1));
+}
+#define CV_TRACE(kind, d, fmt, ...) do { static _Atomic uint64_t n_; if (cv_trace(&n_)) LOG("[codec] %s #%llu dec %u: submits %llu pictures %llu held %d released-pending %u acquirable %u | " fmt, kind,     (unsigned long long)n_, (d)->id, (unsigned long long)(d)->submits, (unsigned long long)(d)->pictures, (d)->nheld, (d)->pcount, (d)->fcount, __VA_ARGS__); } while (0)
 // One packet: decoded at once; its pictures wait for released buffers (end of stream marks the last one, or comes as a buffer of its own)
 static Result cv_dec_submit(uint64_t *out, void *t, const void *data, uint64_t size, int64_t ts, bool eos) {
     cv_dec *d = cv_of(t); if (!d) return CV_R(2004);
     pthread_mutex_lock(&d->mu);
-    if (d->nheld >= CV_HOLD) { if (d->event) hle_clear_system_event(d->event); pthread_mutex_unlock(&d->mu); return CV_BUSY; }
+    if (d->nheld >= CV_HOLD) { if (d->event) hle_clear_system_event(d->event); CV_TRACE("submit busy", d, "%llu bytes", (unsigned long long)size); pthread_mutex_unlock(&d->mu); return CV_BUSY; }
     int got = 0;
     if (d->codec == CV_H264 && d->avc) {   // VideoToolbox reorders: pictures leave in presentation order, all of them at the end of the stream
         if (size && mavc_decode(d->avc, data, (int)size, ts / 1000) < 0) { static int n; if (n++ < 4) LOG("[RED] nn::codec H.264: VideoToolbox could not decode a packet"); }
@@ -323,15 +331,17 @@ static Result cv_dec_submit(uint64_t *out, void *t, const void *data, uint64_t s
     if (eos) { if (got) d->held_eos[d->nheld - 1] = 1; else d->eos_pending = 1; }
     *out = ++d->submits;
     drain(d);
+    CV_TRACE("submit", d, "%llu bytes, %d picture(s) from it, time %lld%s", (unsigned long long)size, got, (long long)ts, eos ? ", end of stream" : "");
     pthread_mutex_unlock(&d->mu);
     return 0;
 }
 static Result cv_dec_acq(uint32_t *idx, cv_sync *sync, void *t) {
     cv_dec *d = cv_of(t); if (!d) return CV_R(2004);
     pthread_mutex_lock(&d->mu);
-    if (!d->fcount) { pthread_mutex_unlock(&d->mu); return CV_NONE; }
+    if (!d->fcount) { CV_TRACE("acquire none", d, "%s", ""); pthread_mutex_unlock(&d->mu); return CV_NONE; }
     uint32_t i = d->fifo[d->fhead]; d->fhead = (d->fhead + 1) % 8; d->fcount--;
     *idx = i; *sync = (cv_sync){CV_SYNC, d->id, i, d->buf[i].gen};
+    CV_TRACE("acquire", d, "buffer %u gen %u filled %d", i, d->buf[i].gen, d->buf[i].filled);
     pthread_mutex_unlock(&d->mu);
     return 0;
 }
@@ -342,12 +352,14 @@ static void cv_dec_rel(void *t, uint32_t i, cv_sync sync) {
     if (d->pcount < CV_BUFS) { d->pend[(d->phead + d->pcount) % CV_BUFS] = i; d->pcount++; }
     if (d->fcount < 8) { d->fifo[(d->fhead + d->fcount) % 8] = i; d->fcount++; } else LOG("[RED] nn::codec: acquirable queue full at release %u", i);
     drain(d);
+    CV_TRACE("release", d, "buffer %u now gen %u filled %d", i, d->buf[i].gen, d->buf[i].filled);
     pthread_mutex_unlock(&d->mu);
 }
 static Result cv_dec_props(uint16_t *w, uint16_t *h, uint16_t *cw, uint16_t *ch, int64_t *ts, bool *eos, void *t, uint32_t i) {
     cv_dec *d = cv_of(t); if (!d || i >= CV_BUFS) return CV_R(2004);
     pthread_mutex_lock(&d->mu);
     int ok = d->buf[i].filled;
+    CV_TRACE("props", d, "buffer %u filled %d", i, ok);
     if (ok) { *w = *cw = d->buf[i].w; *h = *ch = d->buf[i].h; *ts = d->buf[i].ts; *eos = d->buf[i].eos != 0; }
     pthread_mutex_unlock(&d->mu);
     return ok ? 0 : CV_NONE;

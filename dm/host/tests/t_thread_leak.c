@@ -18,16 +18,17 @@ static void t_free(void *p) { if (!p) return; atomic_fetch_sub(&g_live_blocks, 1
 #undef calloc
 #undef free
 
-pthread_key_t g_key18, g_keytls, g_keytlr, g_keygate;
+static __thread void *g_slot[KEY_N];   // the thread slots, per thread as the loader keeps them (loader.c dm_slot_set)
+void dm_slot_set(int slot, void *v) { g_slot[slot] = v; }
+void *dm_slot_get(int slot) { return g_slot[slot]; }
 uint64_t dm_gate_top[1024]; const uint8_t dm_gate_stubs[16 * 1024];   // entry.S's gate tables (guest_gate_stack, which this test does not call)
 
 static int fails, checks;
 #define EXPECT(name, want, got) do { long w_ = (long)(want), g_ = (long)(got); checks++; printf("%-46s expected %-8ld → got %-8ld %s\n", name, w_, g_, w_ == g_ ? "✓" : "✗"); if (w_ != g_) fails++; } while (0)
 static char g_not_heap[64];
-static void *one(void *a) { (void)a; guest_thread_init(); pthread_setspecific(g_keytls, g_not_heap); pthread_setspecific(g_keytlr, g_not_heap + 32); return NULL; }
+static void *one(void *a) { (void)a; guest_thread_init(); dm_slot_set(KEY_KTLS, g_not_heap); dm_slot_set(KEY_KTLR, g_not_heap + 32); return NULL; }
 int main(void) {
     enum { N = 200 };
-    if (pthread_key_create(&g_key18, NULL) || pthread_key_create(&g_keytls, NULL) || pthread_key_create(&g_keytlr, NULL) || pthread_key_create(&g_keygate, NULL)) { printf("key creation failed\n"); return 2; }
     for (int i = 0; i < N; i++) { pthread_t t; if (pthread_create(&t, NULL, one, NULL)) { printf("thread creation failed\n"); return 2; } pthread_join(t, NULL); }
     EXPECT("bytes requested by 200 threads (200 × 9744)", 1948800, atomic_load(&g_total_bytes));
     EXPECT("blocks still not freed after all exited", 0, atomic_load(&g_live_blocks));

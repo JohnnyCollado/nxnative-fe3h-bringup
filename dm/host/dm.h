@@ -7,6 +7,14 @@
 #include <stdlib.h>
 #include <string.h>
 #include "game_profile.h"   // constants of the current game profile (generated from dm/games/<id>/game.tsv, chosen by the Makefile's GAME)
+// A signal handler's registers (crash.c, probe.c, hle_thread.c): the general registers as Apple's arm64 thread state (x0-x28, fp, lr, sp, pc, cpsr), the
+// SIMD registers (__v, __fpsr, __fpcr) and the fault's syndrome. dm/android/compat/include/dm_android_compat.h defines the Linux forms, where the general
+// registers are the same layout in struct sigcontext and the other two are records in its __reserved area
+#ifndef DM_UC_SS
+#define DM_UC_SS(uc) (&(uc)->uc_mcontext->__ss)
+#define DM_UC_NS(uc) (&(uc)->uc_mcontext->__ns)
+#define DM_UC_ESR(uc) ((uc)->uc_mcontext->__es.__esr)
+#endif
 
 // Explicit host work does not occupy a guest core (Metal submission, or a blocked native codec lock). A contended host mutex must count as blocked: a signal's same-core handoff
 // can otherwise wait forever for a peer that needs the signaller's native lock. Uncontended locks retain guest ordering; the counter nests inside existing host work.
@@ -79,8 +87,11 @@ extern module_t *g_mod;         // allocated once from the NSO list and NRO mani
 extern int g_nmod;
 // main's build ID (empty if none): code with fixed addresses in a game's module runs only on the build they were found in
 static inline const char *dm_main_build(void) { for (int i = 0; i < g_nmod; i++) if (!strcmp(g_mod[i].name, "main")) return g_mod[i].build_id; return ""; }
-// Four thread-local slots: K18 = the Switch's x18, KTLS = tpidr_el0, KTLR = tpidrro_el0 (ThreadLocalRegion), KGATE = host gate entry; the actual key numbers are written into the key page by the loader
-extern pthread_key_t g_key18, g_keytls, g_keytlr, g_keygate;
+// Four thread-local slots: K18 = the Switch's x18, KTLS = tpidr_el0, KTLR = tpidrro_el0 (ThreadLocalRegion), KGATE = host gate entry; the loader writes each slot's offset
+// from the slot base register into the key page (Apple: pthread keys, slot = tpidrro_el0 + 8 × key; Android: local-exec thread-locals, slot = tpidr_el0 + offset; loader.c)
+enum { KEY_K18, KEY_KTLS, KEY_KTLR, KEY_KGATE, KEY_N };
+void dm_slot_set(int slot, void *v);
+void *dm_slot_get(int slot);
 
 void load_modules(const char *dir, const char **names, int n);
 const char *dm_module_dir(void);   // the folder load_modules read the modules and the rewriter's tables from (the cheat engine reads main.changed.tsv there)

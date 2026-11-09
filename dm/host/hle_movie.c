@@ -11,7 +11,14 @@
 #include "vpx/vp8dx.h"
 #include "hle_movie_avc.h"   // H.264 on VideoToolbox
 #include "hle_movie_yuv.h"   // md_nv12 / md_rgba, shared with hle_codec_video.c
+#ifdef __APPLE__
 #include <AudioToolbox/AudioToolbox.h>   // AAC
+#else   // Android: no AAC decoder yet (md_aac below outputs silence of the right length); the converter's types, for mdec_t's fields
+typedef void *AudioConverterRef;
+typedef uint32_t UInt32;
+typedef struct { int64_t mStartOffset; uint32_t mVariableFramesInPacket, mDataByteSize; } AudioStreamPacketDescription;
+static inline void AudioConverterDispose(AudioConverterRef c) { (void)c; }
+#endif
 // Vorbis (movie audio tracks, Link's Awakening): stb_vorbis, built into this file (dm/third_party/stb_vorbis); only its push-data API, floats out
 #define STB_VORBIS_NO_STDIO
 #define STB_VORBIS_NO_PULLDATA_API
@@ -364,6 +371,7 @@ static int md_vorbis(mdec_t *d, const uint8_t *p, int n, int slot) {
 // ---------- AAC ----------
 // The demuxer hands over raw AAC frames (1024 samples each) and the AudioSpecificConfig in csd-0. AudioToolbox takes the configuration as an MPEG-4 ES descriptor (the magic cookie built
 // here as FFmpeg's AudioToolbox decoder builds it); without csd-0 an AAC-LC configuration is made from the sample rate and channel count
+#ifdef __APPLE__
 static uint8_t *esds_descr(uint8_t *p, int tag, unsigned n) { *p++ = (uint8_t)tag; for (int i = 3; i > 0; i--) *p++ = (uint8_t)(n >> (7 * i) | 0x80); *p++ = (uint8_t)(n & 0x7f); return p; }
 static OSStatus aac_feed(AudioConverterRef c, UInt32 *np, AudioBufferList *bl, AudioStreamPacketDescription **pd, void *ud) {
     (void)c; mdec_t *d = ud;
@@ -410,6 +418,21 @@ static int md_aac(mdec_t *d, const uint8_t *p, int n, int slot) {
     d->out[slot].bytes = (size_t)frames * 2 * d->ch;
     return frames > 0;
 }
+#else
+// Android: no AAC decoder yet. Each packet gives one frame of silence (1024 samples per channel), so a movie's audio track still advances its clock
+static int md_aac(mdec_t *d, const uint8_t *p, int n, int slot) {
+    (void)p;
+    if (n <= 0) return 0;
+    if (d->ch <= 0) d->ch = 2;
+    if (d->rate <= 0) d->rate = 48000;
+    if (!d->red_vb++) LOG("[RED] movie: no AAC decoder on Android yet, outputting silence (%d channels %d Hz)", d->ch, d->rate);
+    size_t bytes = (size_t)1024 * 2 * d->ch;
+    if (d->out[slot].cap < MD_PCM_CAP) { free(d->out[slot].frm); d->out[slot].frm = malloc(MD_PCM_CAP); d->out[slot].cap = MD_PCM_CAP; }
+    if (bytes > d->out[slot].cap) bytes = d->out[slot].cap;
+    memset(d->out[slot].frm, 0, bytes); d->out[slot].bytes = bytes;
+    return 1;
+}
+#endif
 // The H.264 decoder, made by Configure (when the stream's parameter sets come with it) or by the first packet; RGBA pictures in the native texture mode either way.
 // Absolum's movies bring csd-0 / csd-1 to Configure, and a decoder made there used to stay NV12: the frames' bytes went into the RGBA texture as they were
 static void md_avc_open(mdec_t *d) { if (!d->avc) { d->avc = mavc_new(); if (d->fmt == MD_FMT_ABGR) mavc_set_rgba(d->avc); } }
