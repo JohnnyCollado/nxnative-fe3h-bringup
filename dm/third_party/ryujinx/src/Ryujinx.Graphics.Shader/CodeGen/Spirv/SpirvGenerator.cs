@@ -195,6 +195,8 @@ namespace Ryujinx.Graphics.Shader.CodeGen.Spirv
 
             Declarations.DeclareLocals(context, function);
 
+            UnfoldElseIf(function.MainBlock);
+
             Generate(context, function.MainBlock);
 
             // Functions must always end with a return.
@@ -322,6 +324,62 @@ namespace Ryujinx.Graphics.Shader.CodeGen.Spirv
                 if (context.Definitions.TransformFeedbackEnabled && context.Definitions.LastInVertexPipeline)
                 {
                     context.AddExecutionMode(spvFunc, ExecutionMode.Xfb);
+                }
+            }
+        }
+
+        // AstOptimizer folds "else { if (c) ... }" into an ElseIf block (an "else if" for GLSL). The code below only wires an If to a following Else: an ElseIf got
+        // no branch to it, so its condition and body became unreachable SPIR-V blocks, and the If's false edge went straight to the merge (Fire Emblem Fortune's
+        // Weave's skinned characters, vertex shader 4483c1ba427c4fc9, lost their whole skinning path and were never drawn). Each ElseIf goes back into an Else
+        // holding it as an If, together with the Else / ElseIf blocks that followed it, which the If / Else code below handles.
+        private static void UnfoldElseIf(AstBlock root)
+        {
+            Queue<AstBlock> pending = new();
+            pending.Enqueue(root);
+
+            while (pending.TryDequeue(out AstBlock block))
+            {
+                IAstNode node = block.First;
+
+                while (node != null)
+                {
+                    IAstNode next = AstHelper.Next(node);
+
+                    if (node is AstBlock child)
+                    {
+                        if (child.Type == AstBlockType.ElseIf)
+                        {
+                            AstBlock wrapper = new(AstBlockType.Else);
+                            block.AddBefore(child, wrapper);
+
+                            // the chain's tail: the Else / ElseIf blocks after this one belong to the new Else
+                            List<AstBlock> tail = [];
+                            for (IAstNode t = next; t is AstBlock tb && (tb.Type == AstBlockType.Else || tb.Type == AstBlockType.ElseIf); t = AstHelper.Next(t))
+                            {
+                                tail.Add(tb);
+                            }
+
+                            next = tail.Count > 0 ? AstHelper.Next(tail[^1]) : next;
+
+                            block.Remove(child);
+                            child.TurnIntoIf(child.Condition);
+                            wrapper.Add(child);
+
+                            foreach (AstBlock tb in tail)
+                            {
+                                block.Remove(tb);
+                                wrapper.Add(tb);
+                            }
+
+                            pending.Enqueue(wrapper);   // a further ElseIf in the tail is unfolded there
+                        }
+                        else
+                        {
+                            pending.Enqueue(child);
+                        }
+                    }
+
+                    node = next;
                 }
             }
         }
