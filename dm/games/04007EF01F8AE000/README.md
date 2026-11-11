@@ -25,10 +25,13 @@ All 16,888 translate (current). One shader has 10 texture handles the translator
 
 ## Rendering
 
-- The battle map renders at 1024x576 and DLSS, on MetalFX here, takes it to 2048x1152 ([NVN2's DLSS on MetalFX](../../../docs/reference/rendering.md#nvn2s-dlss-on-metalfx)), which is scaled to the 3840x2160 window. The network's size follows the display ([The display's largest buffer](../../../docs/reference/services.md#the-displays-largest-buffer)).
+- The battle map renders at 1024x576 and DLSS, on MetalFX here and FSR 2 on the Android host, takes it to 2048x1152 ([NVN2's DLSS on MetalFX](../../../docs/reference/rendering.md#nvn2s-dlss-on-metalfx), [NVN2's DLSS on FSR 2](../../../docs/reference/rendering.md#nvn2s-dlss-on-fsr-2-the-android-host)), which is scaled to the 3840x2160 window. The network's size follows the display ([The display's largest buffer](../../../docs/reference/services.md#the-displays-largest-buffer)).
 - Auto exposure does not meter the scene. `5372c7e7cb7bbda2` writes one luminance into a 16x16 RGBA16F target (134.4 on the first map, log2 7.07), `6d0f6db3f0d396a3` makes a 256-bin histogram of it (the single bin 218), and `a0c632d8b5fa925b` averages its 10th to 90th percentile with a 64-bit division, takes the average through two 256x4 curves and moves a 3x1 R16F image towards the result. The tonemap reads `2^-(image[0] + 3) × 1.44`. On the first map `image` holds 8.96, 18.89, 9.46 with neither of the translator fixes below, and 5.555, 15.195, 6.055 with them, when the picture matches the footage. At a scene change the game clears the image to 1 and dispatches these shaders ([Pending clears land before a compute dispatch](../../../docs/reference/rendering.md#pending-clears-land-before-a-compute-dispatch)).
 - Ambient occlusion is interleaved: depth into a 4-layer 512x288 array, four triangles picking the layer by primitive ID, then back together at 1024x576 ([`[[primitive_id]]` in a specialized Metal 4 pipeline](../../../docs/reference/rendering.md#primitive_id-in-a-specialized-metal-4-pipeline)).
 - The enemy's checkered look and the pale squares over the ground are in the published footage too: both are the game's.
+- The frame on the Android host: depth pre-pass (reverse Z, GEQUAL), G-buffer with depth EQUAL, deferred lighting, a forward pass with EQUAL for skinned meshes; FSR 2 takes 960x540 to 1920x1080. Any difference between a mesh's pre-pass and G-buffer positions leaves a black hole.
+- Wind props (banners, awnings): pre-pass vertex shader `2365b68cdec1bbf4`, G-buffer `d04a126c1376d537`, instanced, a sine of time scaled by a sway weight at location 4. Black ribbons from them on the Android host are resolved ([Vertex attribute and stream binds replace the table](../../../docs/reference/rendering.md#vertex-attribute-and-stream-binds-replace-the-table-the-android-host)).
+- Android host status (Odin 3, Adreno 830, Qualcomm's driver, 2026-11-10): the title screen, the floor and the plaza's props draw correctly. GPU about 12.7 ms of passes and compute a frame, FSR 2 about 3.5 ms; the largest single item is compute `9219893bed0b6ccd`.
 - Frame time: 33 ms with the window on screen, and GPU about 12 ms. A covered window reads 80-180 ms, the host's display-link fallback (`front end: window covered`), which measures nothing.
 
 ## Driving it on the Mac
@@ -40,6 +43,10 @@ Keyboard in a window: J K U I are A B X Y, WASD the left stick, Shift + arrows t
 - Nothing past the first map has been played on this build.
 - `stage 1 cb4 has no uniform buffer bound`, once a run, with no effect seen.
 - MetalFX's jitter sign and DLSS's bias mask are unchecked; the bias mask is only logged. No ghosting has been seen so far.
+- FSR 2 on the Android host ([NVN2's DLSS on FSR 2](../../../docs/reference/rendering.md#nvn2s-dlss-on-fsr-2-the-android-host)) runs on the device; ghosting, the jitter's sign and the bias mask are unchecked.
+- Android host: a pixel-shader set with corrected quad swaps (the work folder's `build/spirv_q2`) made the floor worse than the set in use (`spirv_sg`); why is not known.
+- Android host: `an 8/16-bit integer texture read through a float declaration` is logged once a run (format 41), with no effect traced.
+- Android host: Turnip draws magenta blocks; Qualcomm's driver does not.
 - `dm/games/profile_guess.py` does not recognise the SDK's `Generic` version name.
 
 ## Found on this game
@@ -55,3 +62,7 @@ Keyboard in a window: J K U I are A B X Y, WASD the left stick, Shift + arrows t
 - [AV1 movies through SDK 22's decoder](../../../docs/reference/movies.md#av1-movies-through-sdk-22s-decoder).
 - [The Joy-Con mouse pointer](../../../docs/reference/services.md#the-joy-con-mouse-pointer) and [The display's largest buffer](../../../docs/reference/services.md#the-displays-largest-buffer).
 - [An SDK 21 Switch 2 game with a 4.5 GB alias region](../../../docs/reference/memory.md#an-sdk-21-switch-2-game-with-a-45-gb-alias-region): SDK 22's node area.
+- [Vertex attribute and stream binds replace the table](../../../docs/reference/rendering.md#vertex-attribute-and-stream-binds-replace-the-table-the-android-host): black ribbons from wind props on the Android host (resolved).
+- [A depth clear waits for its image's next pass](../../../docs/reference/rendering.md#a-depth-clear-waits-for-its-images-next-pass-the-android-host) and [Uniform buffers off the device's offset alignment](../../../docs/reference/rendering.md#uniform-buffers-off-the-devices-offset-alignment-the-android-host): the floor missing in single frames on the Android host (resolved).
+- [32-lane warps inside a wider host subgroup](../../../docs/reference/shaders.md#32-lane-warps-inside-a-wider-host-subgroup): the dark title screen and battles on the Android host (resolved).
+- [Integer vertex inputs declared float](../../../docs/reference/shaders.md#integer-vertex-inputs-declared-float-the-vulkan-chain) and [The Android host's rolling capture](../../../docs/reference/rendering.md#the-android-hosts-rolling-capture).

@@ -22,9 +22,32 @@ namespace Ryujinx.Graphics.Shader.StructuredIr
                 {
                     if (node is AstAssignment assignment && assignment.Destination is AstOperand propVar)
                     {
+                        // nxnative: a variable passed to a call stays a variable. SPIR-V passes call arguments by pointer (StructuredProgram copies each one to a temporary,
+                        // GenerateCall takes the temporary's pointer); propagated, the call held the value itself, a constant or an expression, and the temporary was removed,
+                        // so translation failed (KeyNotFoundException in CodeGenContext.GetLocalPointer; the shuffle helpers' constant masks: 1,850 of Fire Emblem Fortune's
+                        // Weave's shaders only translated with the optimizer off)
+                        if (propVar.Uses.Any(u => u is AstOperation useOp && (useOp.Inst & Instruction.Mask) == Instruction.Call))
+                        {
+                            continue;
+                        }
+
+                        // nxnative: an assignment whose source writes memory (an atomic, an image atomic) stays where it is, used or not. Upstream removed it when its
+                        // result was unused, and with it the write: all five atomic adds of Fire Emblem Fortune's Weave's exposure histogram (6d0f6db3f0d396a3) were gone
+                        // from the optimized translation, the histogram stayed empty and the picture came out dark (found by running both translations on a PC GPU:
+                        // the work folder's re/csrun). A single use no longer pulls it to the use's position either (past a barrier or another atomic). As
+                        // shirai91/nx2android 44eca7e671 (Tears of the Kingdom's visibility counter)
+                        if (WritesMemory(assignment.Source))
+                        {
+                            continue;
+                        }
+
                         bool isWorthPropagating = propVar.Uses.Count == 1 || IsWorthPropagating(assignment.Source);
 
-                        if (propVar.Defs.Count == 1 && isWorthPropagating)
+                        // nxnative: a subgroup operation's result depends on which lanes are active where it executes, so its assignment is not moved to its use (which may
+                        // sit in another branch or loop, with other lanes active); it is still removed when unused. Moved, the per-warp reductions of Fire Emblem
+                        // Fortune's Weave's light culling (35d12d6f98fa05e2, REDUX as OpGroupNonUniformBitwiseOr) reduced over the lanes of the use's branch: wrong light
+                        // masks in 31 of 120 runs on a PC GPU against the unoptimized translation (the work folder's re/csrun)
+                        if (propVar.Defs.Count == 1 && isWorthPropagating && !HasSubgroupOp(assignment.Source))
                         {
                             PropagateExpression(propVar, assignment.Source);
                         }
@@ -40,6 +63,66 @@ namespace Ryujinx.Graphics.Shader.StructuredIr
             }
 
             RemoveEmptyBlocks(mainBlock);
+        }
+
+        private static bool WritesMemory(IAstNode node)
+        {
+            if (node is not AstOperation op)
+            {
+                return false;
+            }
+
+            Instruction inst = op.Inst & Instruction.Mask;
+
+            if (inst.IsAtomic() || inst == Instruction.ImageAtomic || inst == Instruction.ImageStore || inst == Instruction.Store)
+            {
+                return true;
+            }
+
+            for (int i = 0; i < op.SourcesCount; i++)
+            {
+                if (WritesMemory(op.GetSource(i)))
+                {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        private static bool HasSubgroupOp(IAstNode node)
+        {
+            if (node is not AstOperation op)
+            {
+                return false;
+            }
+
+            switch (op.Inst & Instruction.Mask)
+            {
+                case Instruction.Ballot:
+                case Instruction.Shuffle:
+                case Instruction.ShuffleDown:
+                case Instruction.ShuffleUp:
+                case Instruction.ShuffleXor:
+                case Instruction.VoteAll:
+                case Instruction.VoteAllEqual:
+                case Instruction.VoteAny:
+                case Instruction.QuadBroadcast:
+                case Instruction.QuadSwap:
+                case Instruction.SubgroupBroadcast:
+                case Instruction.SubgroupReduce:
+                    return true;
+            }
+
+            for (int i = 0; i < op.SourcesCount; i++)
+            {
+                if (HasSubgroupOp(op.GetSource(i)))
+                {
+                    return true;
+                }
+            }
+
+            return false;
         }
 
         private static bool IsWorthPropagating(IAstNode source)

@@ -1371,7 +1371,25 @@ namespace Ryujinx.Graphics.Shader.Instructions
             Operand lane = laneImm ? Const(x.Bits(53, 58)) : Register(x.Rb, RegisterType.Gpr);
             Operand c = cImm ? Const(x.Bits(40, 53)) : Register(x.Rc, RegisterType.Gpr);
 
-            (Operand res, Operand valid) = (ShflMode)x.Bits(58, 60) switch
+            // nxnative: a pixel shader's SHFL inside its 2x2 quad (clamp 3, segment mask 0x1c: c = 0x1c03) with a constant lane becomes a quad operation, as the Fire
+            // Emblem Fortune's Weave Eden build does (frontend/ampere/ops_memory.cpp) and Lemon 167eb5934b37: IDX lane 0..3 a quad broadcast, BFLY 1..3 a quad swap
+            // (1 horizontal, 2 vertical, 3 diagonal). The lane is always in the quad, so the predicate is true. See CodeGen/Spirv/Instructions.cs GenerateQuadBroadcast
+            ShflMode qmode = (ShflMode)x.Bits(58, 60);
+            if (laneImm && cImm && context.TranslatorContext.Definitions.Stage == ShaderStage.Fragment && x.Bits(40, 53) == ((28 << 8) | 3) &&
+                !(System.Environment.GetEnvironmentVariable("XLATE_NO_QUAD") is string nq && nq != "0"))
+            {
+                int ql = x.Bits(53, 58);
+                Operand q = qmode == ShflMode.Idx && ql <= 3 ? context.QuadBroadcast(srcA, Const(ql)) :
+                            qmode == ShflMode.Bfly && ql >= 1 && ql <= 3 ? context.QuadSwap(srcA, Const(ql - 1)) : null;
+                if (q != null)
+                {
+                    ASet(context, x, q);
+                    ASetPred(context, x.Bits(81, 84), Const(IrConsts.True));
+                    return;
+                }
+            }
+
+            (Operand res, Operand valid) = qmode switch
             {
                 ShflMode.Idx => context.Shuffle(srcA, lane, c),
                 ShflMode.Up => context.ShuffleUp(srcA, lane, c),

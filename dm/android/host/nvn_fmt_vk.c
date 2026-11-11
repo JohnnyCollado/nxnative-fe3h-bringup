@@ -3,7 +3,7 @@
 // which Metal lacks too) return 0. The 16-bit packed and the DEPTH24 entries are substitutes, as in the Metal table: their bit order in guest memory is unverified, and
 // DEPTH24 maps to D24_UNORM_S8_UINT (the Adreno offers no X8_D24 render target).
 #include <stdint.h>
-#include <vulkan/vulkan.h>
+#include "volk.h"   // Vulkan through function pointers from the chosen driver (vk_driver.c)
 #include "nvn_fmt_vk.h"
 
 typedef struct { uint16_t vk; uint8_t kind, noalpha, rb; } ent;   // kind: 1 exact, 2 substitute

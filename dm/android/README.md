@@ -1,6 +1,6 @@
 # Android launcher
 
-The Android app (`dev.nxnative.fortunesweave`). So far it installs the game data. Starting the game waits for the host to run on Android.
+The Android app (`dev.nxnative.fortunesweave`): it installs the game data, starts the game (`GameActivity`, which runs the host `libdmhost.so` as a process of its own and shows its frames), and holds the settings.
 
 ## Game data
 
@@ -22,6 +22,38 @@ The install is one-time. A start reads `romfs.id` and compares the image's size 
 The data is in the app's own storage folder, so uninstalling removes it; the manifest sets `hasFragileUserData`, so Android offers to keep it. Update the app with `adb install -r`, which keeps it.
 
 `scripts/join_romfs.sh` does the same join from an adb shell, without the app.
+
+## Playing
+
+- **Pause menu:** Back, or − and + held together for a second, opens it over the game; leaving the app opens it too. While it is open the game is in the background (the host's `dm_background`: focus out, sound off, the game's clock and graphics stopped; `DMF_PAUSE` in `host/dm_front_proto.h`). The d-pad or stick moves, A (the right button) picks, B (the bottom one) or Back closes it. It holds Resume, the settings, Restart game and Quit to launcher.
+- **Settings** (`Settings.kt`, shown by `SettingsPanel.kt` in the pause menu and on the launcher's Settings button). Each becomes an environment setting of the host:
+
+  | Setting | Variable | Applies |
+  |---|---|---|
+  | Console mode (docked / handheld) | `DM_OPMODE` | at once (`DMF_OPMODE`, the host's `dm_set_opmode`) |
+  | Game language | `DM_LANG` | at the next start |
+  | Sound | `DM_AUDIO` | at the next start |
+  | GPU driver | `DM_GPU_DRIVER`, `DM_HOOK_DIR` | at the next start |
+  | Frame-rate counter | (the app's) | at once: the host's finished frames a second, top left |
+
+  The frame-rate cap (`DM_FPS_TARGET`) is not offered: this game has no known frame limit for the host to set (`dm/host/hle_fpslock.c`).
+
+## GPU drivers
+
+The host calls Vulkan through [volk](../third_party/volk), so the driver is chosen when it starts (`host/vk_driver.c`): the system's, or a custom one loaded through [libadrenotools](../third_party/libadrenotools), whose hook libraries `build.py` builds into the app's native library folder (`DM_HOOK_DIR`). A custom driver that does not load is logged with `[RED]` and the system driver is used instead. The log names the driver in use (`driver: ...`).
+
+Driver packages are zips in the format other Android emulators use: the driver library and a `meta.json` whose `libraryName` names it. Install one with the launcher's Import GPU driver button, or push the zip into `/sdcard/Android/data/dev.nxnative.fortunesweave/files/import/drivers/`; the launcher installs it the next time it opens. Drivers are kept in the app's internal storage (`files/drivers/`), because libadrenotools refuses drivers on shared storage. Pick one under Settings › GPU driver.
+
+## DLSS
+
+The game's DLSS (`nvnCommandBufferEvaluateDlss`, NVIDIA's neural upscaler, a part of NVN2) runs as [FSR 2](../third_party/fsr2), AMD's temporal upscaler ([NVN2's DLSS on FSR 2](../../docs/reference/rendering.md#nvn2s-dlss-on-fsr-2-the-android-host)), where the Mac host runs it on MetalFX. Before FSR 2 there was a bilinear stretch. The game renders at 1024x576 and the upscaler takes it to 2048x1152. What FSR 2 cannot take (no depth or motion vectors, a sub-rectangle, an output whose format cannot be a storage image) still draws with the bilinear stretch, and the host logs which path each call took.
+
+| Variable | Meaning |
+|---|---|
+| `DM_VK_NO_DLSS` | skip the DLSS command entirely (the output is left as it is) |
+| `DM_FSR2_SHARPEN` | `0` turns FSR 2's sharpening off (on by default) |
+| `DM_FSR2_SHARPNESS` | the sharpness, 0 to 1 (default 0.3) |
+| `DM_FSR2_FRAME_DELTA_MAX` | the longest gap between DLSS calls in ms before the accumulation history resets (default 200, a pause) |
 
 ## Building
 

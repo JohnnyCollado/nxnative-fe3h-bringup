@@ -465,10 +465,10 @@ namespace Ryujinx.Graphics.Shader.CodeGen.Spirv
 
             context.Decorate(perVertexStructType, Decoration.Block);
 
-            if (context.HostCapabilities.ReducedPrecision)
-            {
-                context.MemberDecorate(perVertexStructType, 0, Decoration.Invariant);
-            }
+            // nxnative: the position is invariant in both precision modes (upstream: only relaxed). Two passes that draw the same geometry with different vertex shaders
+            // and compare depth (a depth pre-pass, then a G-buffer with depth EQUAL) need it as much when the math is exact: Fire Emblem Fortune's Weave's floor dropped
+            // out of its G-buffer on Adreno with either the mark alone (relaxed) or NoContraction alone (exact). See docs/reference/shaders.md "Position invariance"
+            context.MemberDecorate(perVertexStructType, 0, Decoration.Invariant);
 
             context.MemberDecorate(perVertexStructType, 0, Decoration.BuiltIn, (LiteralInteger)BuiltIn.Position);
             context.MemberDecorate(perVertexStructType, 1, Decoration.BuiltIn, (LiteralInteger)BuiltIn.PointSize);
@@ -566,7 +566,7 @@ namespace Ryujinx.Graphics.Shader.CodeGen.Spirv
                     context.Decorate(spvVar, Decoration.Patch);
                 }
 
-                if (context.HostCapabilities.ReducedPrecision && ioVariable == IoVariable.Position)
+                if (ioVariable == IoVariable.Position)   // nxnative: in both precision modes (see the gl_PerVertex member above)
                 {
                     context.Decorate(spvVar, Decoration.Invariant);
                 }

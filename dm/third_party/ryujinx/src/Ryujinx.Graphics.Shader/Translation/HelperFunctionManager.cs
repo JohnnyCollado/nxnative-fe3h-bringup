@@ -328,7 +328,7 @@ namespace Ryujinx.Graphics.Shader.Translation
 
             context.Copy(Argument(3), valid);
 
-            Operand result = context.Shuffle(value, GenerateSubgroupShuffleIndex(context, srcThreadId, subgroupSize));
+            Operand result = context.WarpGather(value, srcThreadId, subgroupSize);   // nxnative: broadcasts on a subgroup wider than the warp (EmitterContextInsts.WarpGather)
 
             context.Return(context.ConditionalSelect(valid, result, value));
 
@@ -353,7 +353,7 @@ namespace Ryujinx.Graphics.Shader.Translation
 
             context.Copy(Argument(3), valid);
 
-            Operand result = context.Shuffle(value, GenerateSubgroupShuffleIndex(context, srcThreadId, subgroupSize));
+            Operand result = context.WarpGather(value, srcThreadId, subgroupSize);   // nxnative: broadcasts on a subgroup wider than the warp (EmitterContextInsts.WarpGather)
 
             context.Return(context.ConditionalSelect(valid, result, value));
 
@@ -376,7 +376,7 @@ namespace Ryujinx.Graphics.Shader.Translation
 
             context.Copy(Argument(3), valid);
 
-            Operand result = context.Shuffle(value, GenerateSubgroupShuffleIndex(context, srcThreadId, subgroupSize));
+            Operand result = context.WarpGather(value, srcThreadId, subgroupSize);   // nxnative: broadcasts on a subgroup wider than the warp (EmitterContextInsts.WarpGather)
 
             context.Return(context.ConditionalSelect(valid, result, value));
 
@@ -401,7 +401,7 @@ namespace Ryujinx.Graphics.Shader.Translation
 
             context.Copy(Argument(3), valid);
 
-            Operand result = context.Shuffle(value, GenerateSubgroupShuffleIndex(context, srcThreadId, subgroupSize));
+            Operand result = context.WarpGather(value, srcThreadId, subgroupSize);   // nxnative: broadcasts on a subgroup wider than the warp (EmitterContextInsts.WarpGather)
 
             context.Return(context.ConditionalSelect(valid, result, value));
 

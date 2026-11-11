@@ -180,8 +180,9 @@ HLE_FORCE("_ZN2nn2oe27SetPerformanceConfigurationENS0_15PerformanceModeEi", "set
 // Time counts from the game's first notification fetch. Coexists with front end calls.
 #include <unistd.h>
 // bg=1 / bg=0: the whole "to background / back to foreground" sequence, in the same order as the scene lifecycle in front_ios.m (resign active -> enter background; enter foreground -> become active), minus the audio session reset iOS does on returning.
-// Used to reproduce "after going to the background and back" problems on the Mac (audio take-over and resume, guest clock freeze, graphics suspend); to imitate the process being suspended as well, send dmhost SIGSTOP / SIGCONT between the two items
-static void script_bg(int on) {
+// Used to reproduce "after going to the background and back" problems on the Mac (audio take-over and resume, guest clock freeze, graphics suspend); to imitate the process being suspended as well, send dmhost SIGSTOP / SIGCONT between the two items.
+// The Android app's pause menu calls it too (dm/android/host/nvn_vk_front.c, DMF_PAUSE)
+void dm_background(int on) {
     if (on) { dm_focus_set(2); dm_focus_set(3); dm_audio_suspend(1); guest_clock_freeze_for(1, 1); dm_gfx_suspend(1); }
     else { dm_gfx_suspend(0); guest_clock_freeze_for(1, 0); dm_audio_suspend(0); dm_focus_set(2); dm_focus_set(1); }
 }
@@ -194,7 +195,7 @@ static void *oe_script(void *arg) {
         if (due > now) usleep((useconds_t)((due - now) / 1000));
         if (!strcmp(key, "focus")) dm_focus_set(v);
         else if (!strcmp(key, "opmode")) dm_set_opmode(v);
-        else if (!strcmp(key, "bg")) script_bg(v);
+        else if (!strcmp(key, "bg")) dm_background(v);
         else die("DM_OE_SCRIPT unknown key '%s' (focus / opmode / bg)", key);
     }
     return NULL;

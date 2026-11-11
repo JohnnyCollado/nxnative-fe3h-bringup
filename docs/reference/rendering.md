@@ -871,6 +871,48 @@ The replay on Metal (`dm/gfx/nvn/nvn_mtl.m`) and the Vulkan and OpenGL layers. E
 - **Open:** the jitter's sign has not been checked and the bias mask is only logged; no ghosting has been seen.
 - **Found on:** [Fire Emblem Fortune's Weave](../../dm/games/04007EF01F8AE000/README.md): `gfxa::TaskDLSS`, 1024x576 to 2048x1152.
 
+### NVN2's DLSS on FSR 2 (the Android host)
+
+- **Symptom:** the Android host's `OP_DLSS` replay drew the colour input bilinearly over the output (the stand-in): the Mac's MetalFX scaler has no Vulkan counterpart.
+- **Fix:** AMD's FSR 2 ([dm/third_party/fsr2](../../dm/third_party/fsr2), v2.2.1, written for Windows) is the temporal upscaler. `vkd_dlss` (`dm/android/host/nvn_vk_draw.c`) resolves the DLSS command's textures and views and hands them to `fsr2_dispatch` (`dm/android/host/fsr2_glue.cpp`, a C interface over the C++ SDK), which records FSR 2's passes into the submission's command buffer between the backend's barriers. One context serves the run; a change of the game's formats, sizes or flags recreates it, the old one destroyed once the GPU can no longer use it (`vkx_defer`). What FSR 2 cannot take (no depth or motion vectors, a 3D or multisampled image, a sub-rectangle, an output whose format cannot be a storage image) still draws with the bilinear stretch, and `DM_VK_NO_DLSS` turns the whole command off. The tuning switches are `DM_FSR2_SHARPEN` (default on), `DM_FSR2_SHARPNESS` (default 0.3) and `DM_FSR2_FRAME_DELTA_MAX` (default 200 ms; a longer gap between DLSS calls resets the accumulation history, as a pause would).
+- **Build:** `dm/android/host/fsr2_shaders.py` compiles the SDK's Vulkan shaders with the NDK's glslc (every permutation of the eight passes, deduplicated by blob content, as the SDK's own build does); `build.py` builds the SDK's C++ sources with `fsr2_compat.h` force-included (the Microsoft C runtime's checked string functions on the standard ones). The SDK's Vulkan backend is patched to keep every image in `VK_IMAGE_LAYOUT_GENERAL`, the layout the Android host keeps everything in — without the patch its barriers would record `SHADER_READ_ONLY_OPTIMAL` and transfer layouts the host's other views assume away.
+- **Open:** built but not yet run on the device: the picture, ghosting, the jitter's sign, and the bias mask (only logged, as on the Mac). The frame time delta comes from the host's clock: the game stops calling DLSS while paused, so a long gap resets the history rather than feed a huge delta.
+- **Found on:** [Fire Emblem Fortune's Weave](../../dm/games/04007EF01F8AE000/README.md): `gfxa::TaskDLSS`, 1024x576 to 2048x1152.
+
+### Vertex attribute and stream binds replace the table (the Android host)
+
+- **Symptom:** small wind-animated props stretched into black ribbons across the screen for a few frames at a time, changing with the camera; the meshes around them fine.
+- **Cause:** `nvnCommandBufferBindVertexAttribState(n, states)` and `BindVertexStreamState` replace the whole table: attributes past `n` are off and read the default. The Android host's replay kept the larger of the old and new counts (`OP_BIND_VATTR` / `OP_BIND_VSTREAM` in `dm/android/host/nvn_vk_draw.c`), so a mesh bound with fewer attributes kept the previous mesh's entries above its own. The Mac replay sets the count (`nvn_mtl.m`).
+- **Fix:** the count is the bind's (`first + n`), as on the Mac.
+- **Found on:** [Fire Emblem Fortune's Weave](../../dm/games/04007EF01F8AE000/README.md): its wind vertex shaders read a sway weight at location 4; props with 24-byte vertices have none, and read a stale RG16F entry at offset 24, the next vertex's position bytes. The depth pre-pass and the G-buffer pass inherited different leftovers, so the G-buffer's depth EQUAL test passed nowhere.
+- **How it was found:** `DM_VK_RING_OCC` named the draws (16 and 34 triangles writing 16,000 to 25,000 pixels in the pre-pass, 0 in the G-buffer pass), and the shader re-run on a PC with the captured vertices gave weights of -3,358 to 20,640 ([The Android host's rolling capture](#the-android-hosts-rolling-capture)).
+
+### A depth clear waits for its image's next pass (the Android host)
+
+- **Symptom:** parts of the floor missing from the G-buffer in single frames (black floor with stripes), on Qualcomm's Adreno 830 driver.
+- **Cause:** the game clears its depth image, then draws a depth pre-pass, then the G-buffer with depth EQUAL. The host put the clear in a render pass of its own and loaded the image in the next. Measured with a standalone test on the device, the driver's low-resolution depth test (LRZ) can stay stale across that pair, and it rejects pixels the pre-pass should write.
+- **Fix:** a depth or stencil clear with no draw is kept on its image (`wait_on`, `wait_keep`, `wait_land` in `dm/android/host/nvn_vk_exec.c`) and becomes the load operation of the next pass that covers the image; anything that reads the image first lands it. `OP_CLEAR_TEX` on a depth image is kept the same way instead of `vkCmdClearDepthStencilImage`. `DM_VK_WAIT_CLEAR=0` restores the pass that only clears.
+- **Also in the host, not shown to be needed:** two one-pixel discarding draws at the start of each depth pass (`lrz_kick`, `DM_VK_LRZ_KICK=0` off), and storage buffers bound up to 1 MB past their size (`sbuf_open_on`, `DM_VK_SBUF_EXACT=1` off).
+- **Found on:** [Fire Emblem Fortune's Weave](../../dm/games/04007EF01F8AE000/README.md).
+
+### Uniform buffers off the device's offset alignment (the Android host)
+
+- **Symptom:** a mesh drawn with wrong constants in single frames.
+- **Cause:** NVN binds a uniform buffer at any offset; Vulkan requires `minUniformBufferOffsetAlignment` (64 on the Adreno 830). The host bound at the lower boundary, so the shader read its constants shifted by up to 63 bytes.
+- **Fix:** such a buffer is bound through an aligned copy of its bytes (`ub_copy` in `stage_set`, `dm/android/host/nvn_vk_draw.c`). Storage buffers are offset in the shader instead (`sb_align` in `dm/gfx/tools/vk_spirv.py`).
+- **Found on:** [Fire Emblem Fortune's Weave](../../dm/games/04007EF01F8AE000/README.md): its constant ring moves with each frame's draws, so a frame with more of them put the floor's G-buffer constants off the boundary.
+
+### The Android host's rolling capture
+
+Diagnostics of `dm/android/host`, set in `run/env.txt`; all off by default.
+
+- `DM_VK_RING=<n>`: the last n frames are kept (scene picture, depth, draw list); touching `run/ring_save` writes them to `run/ring/<frame>/`. `DM_VK_RING_HALF=1` keeps the scene at half size and no depth.
+- `DM_VK_RING_FINAL=1`: the presented picture is the scene. Check that the fault is in these pictures before analysing a capture.
+- `DM_VK_RING_STAGES=1`: a 160x90 snapshot of every pass's colour images, in order; the first that differs between a good and a bad frame is the pass that broke. Depth snapshots are too coarse to show thin geometry.
+- `DM_VK_RING_OCC=1`: an occlusion query around every plain draw, numbered in the draw list (`occ <n>`) and saved as `f<frame>_occ.txt`. The draw whose count jumps between a good and a bad frame, or that differs between a pre-pass draw and its EQUAL partner, is the faulty one.
+- `DM_VK_RING_VS=<keys>` with `DM_VK_RING_VTX=1`: the uniform and storage buffers, vertex streams, index buffer and attribute layout of those vertex shaders' draws, so the shader can be run again on a PC with the same inputs. `DM_VK_RING_CS=<keys>` does the same for compute dispatches.
+- `DM_VK_GPU_PROF=1`: GPU time per pass and dispatch. `DM_VK_BISECT=1` with `run/draw_skip`: draws skipped by signature.
+
 ### Metal 4 does not order operations inside one encoder
 
 - **Symptom:** tall blue / textured panels that flickered frame to frame: the fountain's vertex shader pushed the water surface to the top of the screen.

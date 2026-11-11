@@ -638,6 +638,20 @@ Finding, keying and translating shaders (`dm/gfx/tools/shader_split.py`, `dmsh_b
 - **Found on:** [Monster Hunter Rise](../../dm/games/0100B04011742000/README.md) (about 4 % of its vertex shaders); [Xenoblade Chronicles 3](../../dm/games/010074F013262000/README.md) (vertex `4b98320a0f512efe`, a prefix ballot that reads `SubgroupLtMask` through a component pointer).
 - **Note:** the rewrite covers vertex shaders only: two of Bayonetta 3's domain shaders still fail this way ([Tessellation stages are not drawn](#tessellation-stages-are-not-drawn)).
 
+### 32-lane warps inside a wider host subgroup
+
+- **Symptom:** compute shaders that reduce or shuffle across a warp gave wrong results on Adreno (dark title screen and battles: light culling and exposure), or ran for hundreds of milliseconds a dispatch.
+- **Cause:** Maxwell and Ampere warps are 32 lanes; Qualcomm's driver runs 64-lane subgroups. Code written for Metal's 32-wide SIMD groups read the first warp's lanes from the second.
+- **Fix:** the vendored translator works per warp when the host subgroup is wider (`subgroup` 64 in `dm/gfx/tools/vk_spirv.py`): shuffles and ballots stay in the thread's own warp, and REDUX is one `OpGroupNonUniform*` reduction per warp with the other warps' lanes giving the identity. The optimizer does not move an assignment that holds a subgroup operation to its use (`HasSubgroupOp`), nor remove one that writes memory. The list is in [dm/third_party/ryujinx/README.md](../../dm/third_party/ryujinx/README.md). The host probes the subgroup layout at start (`vkx_sg_probe`).
+- **Found on:** [Fire Emblem Fortune's Weave](../../dm/games/04007EF01F8AE000/README.md): light culling `35d12d6f98fa05e2`, tile depth bounds and exposure `a0c632d8b5fa925b`. All 190 compute shaders give the same results on a PC and on the Adreno 830 with generated inputs.
+
+### Integer vertex inputs declared float (the Vulkan chain)
+
+- **Symptom:** none proven on Adreno; undefined values by Vulkan's rules (`VUID-vkCmdDraw-Input-08734`). On Metal the same mismatch throws every skinned model off screen.
+- **Cause:** the machine code does not say an attribute's type, so the translator declares every input float; bone indices come in `R8UI` / `RG8UI` / `RGBA8UI` formats and the shader only bit-casts them.
+- **Fix:** `vk_spirv.py` re-translates a vertex shader with the inputs it only uses as integers declared `uint` (`int_inputs`, on the SPIR-V; `INT_INPUTS=0` off), as `dmsh_build.py` does on the MSL.
+- **Found on:** [Fire Emblem Fortune's Weave](../../dm/games/04007EF01F8AE000/README.md): 161 vertex shaders, location 4. It did not change the picture on the Adreno 830.
+
 ### Geometry shaders that only pick the layer
 
 - **Symptom:** the tone mapper read an empty LUT and the screen came out a flat blue.

@@ -1,3 +1,5 @@
+# Game art used by the Android launcher, kept out of the repository (dm/android/app/build.gradle.kts)
+dm/android/app/art_res/
 # Build outputs (Xcode derived data, produced by the scripts under dm/ios)
 .iosdd/
 .iosdd_mac/

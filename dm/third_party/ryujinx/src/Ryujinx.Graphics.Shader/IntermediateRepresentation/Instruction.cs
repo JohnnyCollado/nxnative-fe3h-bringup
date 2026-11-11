@@ -128,6 +128,14 @@ namespace Ryujinx.Graphics.Shader.IntermediateRepresentation
         // nxnative: Ampere HMMA.16816 with an f16 accumulator, lowered to a call by TensorPass, and a barrier for the lanes of one subgroup
         MatrixMultiplyAdd,
         SubgroupBarrier,
+        // nxnative: a pixel shader's SHFL inside its 2x2 quad, as quad operations (InstEmitAmpereAlu.AShfl)
+        QuadBroadcast,
+        QuadSwap,
+        // nxnative: the value of one lane of the subgroup, the lane a constant (EmitterContextInsts.WarpGather)
+        SubgroupBroadcast,
+        // nxnative: a value reduced over the subgroup's active lanes; Index: 0 and, 1 or, 2 xor, 3 sum, 4 signed min, 5 signed max, 6 unsigned min, 7 unsigned max
+        // (InstEmitAmpereTensor.ARedux)
+        SubgroupReduce,
 
         Count,
 

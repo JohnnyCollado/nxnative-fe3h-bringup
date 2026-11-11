@@ -129,6 +129,10 @@ namespace Ryujinx.Graphics.Shader.CodeGen.Spirv
             Add(Instruction.ShuffleDown,              GenerateShuffleDown);
             Add(Instruction.ShuffleUp,                GenerateShuffleUp);
             Add(Instruction.ShuffleXor,               GenerateShuffleXor);
+            Add(Instruction.QuadBroadcast,            GenerateQuadBroadcast);
+            Add(Instruction.QuadSwap,                 GenerateQuadSwap);
+            Add(Instruction.SubgroupBroadcast,        GenerateSubgroupBroadcast);
+            Add(Instruction.SubgroupReduce,           GenerateSubgroupReduce);
             Add(Instruction.Sine,                     GenerateSine);
             Add(Instruction.SquareRoot,               GenerateSquareRoot);
             Add(Instruction.Store,                    GenerateStore);
@@ -1184,6 +1188,58 @@ namespace Ryujinx.Graphics.Shader.CodeGen.Spirv
 
             SpvInstruction result = context.GroupNonUniformShuffleUp(context.TypeFP32(), context.Constant(context.TypeU32(), (int)Scope.Subgroup), value, index);
 
+            return new OperationResult(AggregateType.FP32, result);
+        }
+
+        // nxnative: quad operations take every pixel of the 2x2 quad, helper pixels included, where a plain subgroup shuffle may leave a helper pixel out (Adreno:
+        // garbage, streaks where a shader divides by it) or pair other lanes than the quad's (Adreno: thin dashed lines). As the Fire Emblem Fortune's Weave Eden build
+        // does (dm/third_party/eden-fefw, frontend/ampere/ops_memory.cpp SHFL) and Lemon 167eb5934b37. The lane / direction must be a constant
+        private static OperationResult GenerateQuadBroadcast(CodeGenContext context, AstOperation operation)
+        {
+            context.AddCapability(Capability.GroupNonUniformQuad);
+            SpvInstruction value = context.GetFP32(operation.GetSource(0));
+            SpvInstruction index = context.GetU32(operation.GetSource(1));
+            SpvInstruction result = context.GroupNonUniformQuadBroadcast(context.TypeFP32(), context.Constant(context.TypeU32(), (int)Scope.Subgroup), value, index);
+            return new OperationResult(AggregateType.FP32, result);
+        }
+
+        // nxnative: one lane's value, the lane a constant (EmitterContextInsts.WarpGather)
+        private static OperationResult GenerateSubgroupBroadcast(CodeGenContext context, AstOperation operation)
+        {
+            SpvInstruction value = context.GetFP32(operation.GetSource(0));
+            SpvInstruction lane = context.GetU32(operation.GetSource(1));
+            SpvInstruction result = context.GroupNonUniformBroadcast(context.TypeFP32(), context.Constant(context.TypeU32(), (int)Scope.Subgroup), value, lane);
+            return new OperationResult(AggregateType.FP32, result);
+        }
+
+        // nxnative: a value reduced over the subgroup's active lanes in one instruction (InstEmitAmpereTensor.ARedux; Index: the operation)
+        private static OperationResult GenerateSubgroupReduce(CodeGenContext context, AstOperation operation)
+        {
+            context.AddCapability(Capability.GroupNonUniformArithmetic);
+            SpvInstruction scope = context.Constant(context.TypeU32(), (int)Scope.Subgroup);
+            SpvInstruction u32 = context.TypeU32(), s32 = context.TypeS32();
+            IAstNode src = operation.GetSource(0);
+            const GroupOperation R = GroupOperation.Reduce;
+            SpvInstruction result = operation.Index switch
+            {
+                0 => context.GroupNonUniformBitwiseAnd(u32, scope, R, context.GetU32(src)),
+                1 => context.GroupNonUniformBitwiseOr(u32, scope, R, context.GetU32(src)),
+                2 => context.GroupNonUniformBitwiseXor(u32, scope, R, context.GetU32(src)),
+                3 => context.GroupNonUniformIAdd(u32, scope, R, context.GetU32(src)),
+                4 => context.Bitcast(u32, context.GroupNonUniformSMin(s32, scope, R, context.GetS32(src))),
+                5 => context.Bitcast(u32, context.GroupNonUniformSMax(s32, scope, R, context.GetS32(src))),
+                6 => context.GroupNonUniformUMin(u32, scope, R, context.GetU32(src)),
+                _ => context.GroupNonUniformUMax(u32, scope, R, context.GetU32(src)),
+            };
+            return new OperationResult(AggregateType.U32, result);
+        }
+
+        private static OperationResult GenerateQuadSwap(CodeGenContext context, AstOperation operation)
+        {
+            context.AddCapability(Capability.GroupNonUniformQuad);
+            SpvInstruction value = context.GetFP32(operation.GetSource(0));
+            SpvInstruction direction = context.GetU32(operation.GetSource(1));
+            SpvInstruction result = context.GroupNonUniformQuadSwap(context.TypeFP32(), context.Constant(context.TypeU32(), (int)Scope.Subgroup), value, direction);
             return new OperationResult(AggregateType.FP32, result);
         }
 

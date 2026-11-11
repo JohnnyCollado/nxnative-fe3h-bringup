@@ -58,7 +58,23 @@ def job_for(key, name, rec, out, facts):
          # The translator's optimizer stays on here (debug off), unlike dmsh_build.py's Metal route, where the Metal compiler optimizes the MSL after it: the Adreno
          # driver's compiler handles the unoptimized SPIR-V badly. Fortune's Weave's light culling (35d12d6f98fa05e2, 32x18x16 groups) took 205 ms per dispatch as
          # translated in debug mode and tripped the GPU's watchdog (the device was lost at the first 3D frame); optimized, its frame runs in well under 30 ms
-         'debug': os.environ.get('XLATE_DEBUG', '0') != '0', 'reduced': os.environ.get('XLATE_REDUCED', '1') == '1'}
+         'debug': os.environ.get('XLATE_DEBUG', '0') != '0',
+         # Relaxed precision (no NoContraction: the driver may fuse a multiply and an add) except in vertex shaders: their positions must come out bit-identical between
+         # passes that draw the same geometry with different vertex shaders, as Maxwell's fixed instructions give, or a depth EQUAL test fails on some pixels. Fire Emblem
+         # Fortune's Weave draws a depth pre-pass, then its G-buffer with depth EQUAL; relaxed, Adreno fused the two shaders' position math differently and the floor
+         # dropped out of the G-buffer in some frames (black floor with stripes, black blocks on camera cuts; the stage capture, logs_mem3/003096). XLATE_REDUCED=0 turns
+         # it off everywhere, XLATE_REDUCED_VS=1 back on for vertex shaders
+         'reduced': os.environ.get('XLATE_REDUCED', '1') == '1' and (stage != 'vs' or os.environ.get('XLATE_REDUCED_VS', '0') == '1'),
+         # the alignment the Vulkan host binds storage buffers at (Program.cs QueryHostStorageBufferOffsetAlignment): the device's minStorageBufferOffsetAlignment, 64 on the
+         # Adreno. Translated for 16, a buffer between two 64-byte boundaries was read shifted (Fortune's Weave's battles). SB_ALIGN=0 leaves it out (the translator's 16)
+         **({'sb_align': int(os.environ.get('SB_ALIGN', '64'))} if os.environ.get('SB_ALIGN', '64') != '0' else {}),
+         # texture gathers nudged by 1/512 texel (Program.cs QueryHostGatherBiasPrecision): Adreno picks the other 2x2 block than Maxwell for a coordinate right at a
+         # texel centre (Lemon 8d62cd2dc038, TOTK's 64x64 shadow squares; the Fortune's Weave Eden build turns the nudge on for Qualcomm and Turnip, vk_pipeline_cache.cpp
+         # need_gather_subpixel_offset). GATHER_BIAS=0 leaves it out
+         **({'gather_bias': int(os.environ.get('GATHER_BIAS', '8'))} if os.environ.get('GATHER_BIAS', '8') != '0' else {}),
+         # the device's subgroup size (Program.cs QueryHostSubgroupSize): Qualcomm's Adreno driver runs 64 lanes (Turnip up to 128: pin 64), the translator emulates 32-lane warps inside them; its 128 path picks
+         # the ballot word by lane id >> 5, so it holds for 64 too (shirai91/nx2android shader_vk.py SUBGROUP). SUBGROUP=0 leaves it out (32: lanes past 32 read wrong lanes)
+         **({'subgroup': int(os.environ.get('SUBGROUP', '64'))} if os.environ.get('SUBGROUP', '64') != '0' else {})}
     if key not in facts: j['no_facts'] = True
     else: j.update(facts[key])
     return j
@@ -97,6 +113,42 @@ def add_format_caps(path):
     return add
 
 
+def int_inputs(path):
+    """Inputs a vertex shader declares float but only ever uses as integers (every value read from them ends in a bit cast to int / uint) → {location: 'uint'}.
+    Maxwell does no type conversion when reading vertex attribute registers: the bit pattern of an integer format (bone indices R8UI / RG8UI / RGBA8UI) goes into the
+    register as is and the shader uses it as an integer. The answer table has no attribute types (the machine code does not say them), so the translator's attribute
+    type queries all default to float, and a UINT vertex format then feeds a float input: undefined values in Vulkan (VUID-vkCmdDraw-Input-08734). dmsh_build.py's
+    int_inputs is the same step on the MSL text (Metal converts to float there and every skinned model is thrown off screen); on Adreno the bits mostly came through.
+    Fortune's Weave: 176 vertex shaders, location 4 or 9 (the capture logs_mem3/003542: RG8UI / RGBA8UI at location 4 of the skinned depth pre-pass)."""
+    d = open(path, 'rb').read(); w = [int.from_bytes(d[i:i + 4], 'little') for i in range(0, len(d), 4)]
+    if len(w) < 5 or w[0] != 0x07230203: return {}
+    ins = []; i = 5
+    while i < len(w):
+        n, op = w[i] >> 16, w[i] & 0xffff
+        if n == 0: return {}
+        ins.append((op, w[i + 1:i + n])); i += n
+    loc, ptr, ints, floats, vec, inv, local = {}, {}, set(), set(), {}, {}, set()
+    for op, a in ins:
+        if op == 71 and a[1] == 30: loc[a[0]] = a[2]          # OpDecorate Location
+        elif op == 32: ptr[a[0]] = a[2]                       # OpTypePointer
+        elif op == 21: ints.add(a[0])
+        elif op == 22: floats.add(a[0])
+        elif op == 23: vec[a[0]] = a[1]
+        elif op == 59 and a[2] == 1: inv[a[1]] = a[0]         # OpVariable Input
+        elif op == 59 and a[2] == 7: local.add(a[1])          # OpVariable Function
+    cand = {v: loc[v] for v, pt in inv.items() if v in loc and vec.get(ptr[pt], ptr[pt]) in floats}
+    der = {v: v for v in cand}; stat = {v: [0, 0] for v in cand}   # id → the input it carries; input → [integer uses, other uses]
+    for op, a in ins:
+        if op in (5, 6, 15, 16, 71, 72, 59): continue        # names, entry point, decorations, the variable itself
+        if op in (65, 66, 61, 81) and a[2] in der: der[a[1]] = der[a[2]]   # access chain, load, composite extract: still the input's value
+        elif op == 124 and a[2] in der: stat[der[a[2]]][0 if vec.get(a[0], a[0]) in ints else 1] += 1   # OpBitcast
+        elif op == 62 and a[1] in der and a[0] in local and a[0] not in der: der[a[0]] = der[a[1]]       # a plain copy into a local: follow the local
+        else:
+            for x in a:
+                if x in der: stat[der[x]][1] += 1
+    return {str(cand[v]): 'uint' for v in cand if stat[v][0] and not stat[v][1]}
+
+
 def xlate_cmd():
     x = os.environ.get('XLATE', os.path.join(dmsh_chain.XLATE_DIR, 'dmsh_xlate'))
     return ['dotnet', x] if x.endswith('.dll') else [x]
@@ -133,11 +185,29 @@ def main():
             if m: errors[m.group(1)] = m.group(2)[:200]
         if r.returncode and not any(re.match(r'\[RED\] \w+:', ln) for ln in r.stderr.splitlines()):
             print(f'[RED] the translator exited with {r.returncode}: {r.stderr.strip()[-400:]}', flush=True)
+    # second pass: vertex shaders re-translated with the inputs they only use as integers declared uint (see int_inputs). INT_INPUTS=0 leaves it out
+    redo = {}
+    if os.environ.get('INT_INPUTS', '1') != '0':
+        for key, j in jobs.items():
+            spv = os.path.join(out, key + '.spv')
+            if j['stage'] != 'vs' or key in errors or not os.path.exists(spv): continue
+            extra = {l: t for l, t in int_inputs(spv).items() if l not in j['attr']}
+            if extra: j['attr'] = {**j['attr'], **extra}; redo[key] = extra
+    if redo:
+        for key in redo: os.remove(os.path.join(out, key + '.spv'))
+        todo = list(redo); chunks = [todo[i::nj] for i in range(nj) if todo[i::nj]]
+        with cf.ThreadPoolExecutor(nj) as ex: results = list(ex.map(run, chunks))
+        for r in results:
+            for ln in r.stderr.splitlines():
+                m = re.match(r'\[RED\] (\w+): (.*)', ln)
+                if m: errors[m.group(1)] = 'integer-input retranslation: ' + m.group(2)[:160]
+        json.dump(list(jobs.values()), open(os.path.join(out, 'jobs.json'), 'w'), indent=0)
+        print(f'{len(redo)} vertex shaders re-translated with integer inputs', flush=True)
     for key, j in jobs.items():
         spv = os.path.join(out, key + '.spv')
         if key in errors: summary[key] = (j['stage'], 'failed', errors[key])
         elif os.path.exists(spv):
-            notes = (['no facts (defaults)'] if j.get('no_facts') else []) + [{CAP_READ_WITHOUT_FORMAT: 'declared StorageImageReadWithoutFormat', CAP_WRITE_WITHOUT_FORMAT: 'declared StorageImageWriteWithoutFormat'}[c] for c in add_format_caps(spv)]
+            notes = (['no facts (defaults)'] if j.get('no_facts') else []) + (['integer inputs ' + ','.join(sorted(redo[key], key=int))] if key in redo else []) + [{CAP_READ_WITHOUT_FORMAT: 'declared StorageImageReadWithoutFormat', CAP_WRITE_WITHOUT_FORMAT: 'declared StorageImageWriteWithoutFormat'}[c] for c in add_format_caps(spv)]
             summary[key] = (j['stage'], 'ok', '; '.join(notes))
         else: summary[key] = (j['stage'], 'failed', 'no spv')
     with open(os.path.join(out, 'summary.tsv'), 'w', encoding='utf-8', newline='\n') as f:

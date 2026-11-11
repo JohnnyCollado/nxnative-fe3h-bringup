@@ -8,6 +8,8 @@
 #   - the assembly (entry.S, nvn_entry.S, nvn_thunks.S) is Mach-O syntax: elf_asm() rewrites a copy for ELF (symbol names without the leading underscore,
 #     :lo12: for @PAGEOFF, .hidden for .private_extern, .zerofill as a .bss block)
 #   - dav1d's config.h is the Mac's with PREFIX 0 (ELF symbols) and HAVE_GETAUXVAL 1 (Linux CPU feature detection: the Odin 3's Snapdragon 8 Elite has no SVE)
+#   - FSR 2 (dm/third_party/fsr2): its Vulkan shaders are compiled by fsr2_shaders.py with the NDK's glslc into gen-android/fsr2-shaders (skipped when the headers are
+#     fresh), and its C++ sources build as their own group with fsr2_compat.h force-included (Microsoft checked-string stand-ins): vkd_dlss's temporal upscaler
 # Rebuilds only what changed: each object's dependencies come from the compiler (-MD), and an object is rebuilt when any of them, or the flags, are newer.
 # Usage: build.py [--game <title ID>] [-j N] [--clean]   (exit 1 on error). Output: dm/host/gen-android/dmhost
 import argparse, concurrent.futures as cf, glob, hashlib, os, re, shutil, subprocess, sys, time
@@ -23,12 +25,17 @@ EXCLUDE = {   # Apple-framework sources with Android stand-ins in dm/android/hos
 }   # hle_audio.c is built: every output plays through its silent sink on Android (compat AudioToolbox.h fails the Core Audio calls if they are reached)
 
 
-def ndk_bin():
+def ndk():
+    """The newest NDK's root and its prebuilt host tag"""
     sdk = os.environ.get('ANDROID_HOME') or os.path.expandvars(r'%LOCALAPPDATA%\Android\Sdk')
     ndks = sorted(glob.glob(os.path.join(sdk, 'ndk', '*')), key=lambda p: [int(x) for x in re.findall(r'\d+', os.path.basename(p))])
     if not ndks: sys.exit(f'[RED] no Android NDK under {sdk}/ndk')
-    host_tag = 'windows-x86_64' if os.name == 'nt' else ('darwin-x86_64' if sys.platform == 'darwin' else 'linux-x86_64')
-    b = os.path.join(ndks[-1], 'toolchains', 'llvm', 'prebuilt', host_tag, 'bin')
+    return ndks[-1], 'windows-x86_64' if os.name == 'nt' else ('darwin-x86_64' if sys.platform == 'darwin' else 'linux-x86_64')
+
+
+def ndk_bin():
+    root, tag = ndk()
+    b = os.path.join(root, 'toolchains', 'llvm', 'prebuilt', tag, 'bin')
     return os.path.join(b, 'clang' + ('.exe' if os.name == 'nt' else '')), os.path.join(b, 'llvm-ar' + ('.exe' if os.name == 'nt' else ''))
 
 
@@ -73,6 +80,25 @@ def dav1d_config(dst_dir):
     if not os.path.exists(p) or open(p, encoding='utf-8').read() != s: open(p, 'w', encoding='utf-8', newline='\n').write(s)
 
 
+def fsr2_shaders(out, py, j):
+    """FSR 2's Vulkan shaders (dm/third_party/fsr2): every permutation of each pass compiled with the NDK's glslc into <out>/fsr2-shaders/<pass>_permutations.h,
+    the blob tables vk/shaders/ffx_fsr2_shaders_vk.cpp includes (fsr2_shaders.py). Skipped while the headers are newer than the shaders and the script"""
+    gen = os.path.join(out, 'fsr2-shaders'); os.makedirs(gen, exist_ok=True)
+    script = os.path.join(HERE, 'fsr2_shaders.py')
+    srcs = glob.glob(os.path.join(DM, 'third_party', 'fsr2', 'src', 'ffx-fsr2-api', 'shaders', '*.glsl'))
+    passes = ('ffx_fsr2_tcr_autogen_pass', 'ffx_fsr2_autogen_reactive_pass', 'ffx_fsr2_accumulate_pass', 'ffx_fsr2_compute_luminance_pyramid_pass',
+              'ffx_fsr2_depth_clip_pass', 'ffx_fsr2_lock_pass', 'ffx_fsr2_reconstruct_previous_depth_pass', 'ffx_fsr2_rcas_pass')
+    heads = [os.path.join(gen, p + '_permutations.h') for p in passes]
+    if all(os.path.exists(h) and os.path.getmtime(h) > max(os.path.getmtime(s) for s in srcs) and os.path.getmtime(h) > os.path.getmtime(script) for h in heads):
+        print(f'FSR 2 shaders up to date ({len(heads)} headers)'); return gen
+    root, tag = ndk()
+    glslc = os.path.join(root, 'shader-tools', tag, 'glslc' + ('.exe' if os.name == 'nt' else ''))
+    if not os.path.exists(glslc): sys.exit(f'[RED] no glslc in the NDK ({glslc})')
+    r = subprocess.run([py, '-X', 'utf8', script, glslc, gen, '-j', str(j)])
+    if r.returncode: sys.exit('[RED] fsr2_shaders.py failed')
+    return gen
+
+
 def deps_of(d):
     if not os.path.exists(d): return None
     txt = open(d, encoding='utf-8', errors='replace').read().replace('\\\n', ' ')
@@ -105,6 +131,7 @@ def main():
     r = subprocess.run([py, '-X', 'utf8', os.path.join(DM, 'games', 'game.py'), 'header', a.game, os.path.join(gen, 'game_profile.h')], capture_output=True, text=True)
     if r.returncode: sys.exit(f'[RED] game.py header: {r.stdout}{r.stderr}')
     dav1d_config(os.path.join(OUT, 'dav1d-config'))
+    gen_fsr = fsr2_shaders(OUT, py, a.j)
     asm_dir = os.path.join(OUT, 'asm'); os.makedirs(asm_dir, exist_ok=True)
     asm = []
     for rel in ('host/entry.S', 'gfx/nvn/nvn_entry.S', 'gfx/nvn/nvn_thunks.S'):
@@ -113,14 +140,20 @@ def main():
     target = [f'--target=aarch64-linux-android{API}']
     inc = [os.path.join(DM, 'android', 'compat', 'include'), os.path.join(DM, 'gfx', 'nvn', 'include'), os.path.join(DM, 'third_party', 'vulkan-headers', 'include'),
            gen, os.path.join(DM, 'third_party', 'libvpx'), os.path.join(DM, 'third_party', 'dav1d', 'include'), os.path.join(DM, 'third_party', 'stb_vorbis'), HOST,
-           os.path.join(DM, 'gfx', 'nvn'), os.path.join(DM, 'gfx', 'tex'), os.path.join(HOST, 'gen', 'msl-macosx')]
-    cflags = target + ['-O1', '-g', '-std=gnu11', '-fPIE', '-Wall', '-Wno-unused-function', '-Wno-unknown-pragmas', '-D_GNU_SOURCE', '-DDM_ANDROID=1',
+           os.path.join(DM, 'gfx', 'nvn'), os.path.join(DM, 'gfx', 'tex'), os.path.join(HOST, 'gen', 'msl-macosx'),
+           os.path.join(DM, 'third_party', 'volk'), os.path.join(DM, 'third_party', 'libadrenotools', 'include')]
+    cflags = target + ['-O1', '-g', '-std=gnu11', '-fPIE', '-Wall', '-Wno-unused-function', '-Wno-unknown-pragmas', '-D_GNU_SOURCE', '-DDM_ANDROID=1', '-DVK_USE_PLATFORM_ANDROID_KHR=1',
                        '-include', 'dm_android_compat.h'] + ['-I' + p for p in inc]
     # third-party code keeps its own flags (as the Mac Makefile builds it), without the host's compat header
     vpx = os.path.join(DM, 'third_party', 'libvpx'); dav = os.path.join(DM, 'third_party', 'dav1d')
     vpx_flags = target + ['-O2', '-g', '-fPIE', '-I' + vpx, '-I' + os.path.join(vpx, 'config')]
     dav_flags = target + ['-O2', '-g', '-fPIE', '-fvisibility=hidden', '-fomit-frame-pointer', '-I' + os.path.join(OUT, 'dav1d-config'), '-I' + dav,
                           '-I' + os.path.join(dav, 'include'), '-I' + os.path.join(dav, 'config')]
+    # volk (Vulkan through function pointers, so the driver can be chosen at run time: vk_driver.c) and libadrenotools' loader with its linker-namespace helper
+    volk = os.path.join(DM, 'third_party', 'volk'); adt = os.path.join(DM, 'third_party', 'libadrenotools')
+    volk_flags = target + ['-O2', '-g', '-fPIE', '-DVK_USE_PLATFORM_ANDROID_KHR=1', '-I' + os.path.join(DM, 'third_party', 'vulkan-headers', 'include')]
+    adt_flags = target + ['-O2', '-g', '-fPIE', '-std=c++20', '-I' + os.path.join(adt, 'include'), '-I' + adt, '-I' + os.path.join(adt, 'lib', 'linkernsbypass')]
+    adt_src = [os.path.join(adt, 'src', 'driver.cpp'), os.path.join(adt, 'lib', 'linkernsbypass', 'android_linker_ns.cpp'), os.path.join(adt, 'lib', 'linkernsbypass', 'elf_soname_patcher.cpp')]
 
     host_src = sorted(glob.glob(os.path.join(HOST, '*.c')))
     gfx_src = sorted(sum((glob.glob(os.path.join(DM, 'gfx', d, '*.c')) for d in ('', 'nvn', 'tex')), []))
@@ -143,6 +176,16 @@ def main():
     add('asm', asm, target + ['-g'], asm_dir)
     add('vpx', vpx_src, vpx_flags, vpx)
     add('dav1d', dav_src, dav_flags, dav)
+    add('volk', [os.path.join(volk, 'volk.c')], volk_flags, volk)
+    add('adrenotools', adt_src, adt_flags, adt)
+    # FSR 2 (dm/third_party/fsr2, written for Windows): its core and Vulkan backend, the shader blob table (gen_fsr) and the C++ glue (fsr2_glue.cpp) behind the
+    # C interface vkd_dlss calls. fsr2_compat.h force-included stands in for the Microsoft C runtime's checked string functions; FFX_GCC drops its __declspec exports
+    fsr = os.path.join(DM, 'third_party', 'fsr2', 'src', 'ffx-fsr2-api')
+    fsr_flags = target + ['-O2', '-g', '-fPIE', '-std=c++17', '-D_GNU_SOURCE', '-DVK_USE_PLATFORM_ANDROID_KHR=1', '-DFFX_GCC=1', '-DFFX_BACKEND_VK=1', '-Wno-unknown-pragmas',
+                          '-include', 'fsr2_compat.h', '-I' + HERE, '-I' + fsr, '-I' + gen_fsr, '-I' + os.path.join(DM, 'third_party', 'volk'),
+                          '-I' + os.path.join(DM, 'third_party', 'vulkan-headers', 'include')]
+    add('fsr2', [os.path.join(fsr, 'ffx_fsr2.cpp'), os.path.join(fsr, 'vk', 'ffx_fsr2_vk.cpp'), os.path.join(fsr, 'vk', 'shaders', 'ffx_fsr2_shaders_vk.cpp'),
+                 os.path.join(HERE, 'fsr2_glue.cpp')], fsr_flags, DM)
 
     todo = [j for j in jobs if stale(j[1], j[1][:-2] + '.d', j[3])]
     print(f'{len(jobs)} objects, {len(todo)} to compile ({a.j} at a time)', flush=True)
@@ -171,7 +214,8 @@ def main():
         print(f'up to date: {exe}'); app_libs(cc, target, exe); return
     rsp = os.path.join(OUT, 'link.rsp')
     open(rsp, 'w', encoding='utf-8').write('\n'.join('"' + o.replace('\\', '/') + '"' for o in objs))
-    r = subprocess.run([cc] + target + ['-fPIE', '-pie', '-g', '-o', exe, '@' + rsp, '-lm', '-ldl', '-llog', '-lvulkan', '-lnativewindow', '-landroid', '-laaudio', '-Wl,--no-undefined', '-Wl,--error-limit=0'], capture_output=True, text=True, encoding='utf-8', errors='replace')
+    # no -lvulkan: the driver is opened at run time (vk_driver.c); clang++ with the C++ runtime linked in, for libadrenotools
+    r = subprocess.run([cxx(cc)] + target + ['-fPIE', '-pie', '-g', '-static-libstdc++', '-o', exe, '@' + rsp, '-lm', '-ldl', '-llog', '-lnativewindow', '-landroid', '-laaudio', '-Wl,--no-undefined', '-Wl,--error-limit=0'], capture_output=True, text=True, encoding='utf-8', errors='replace')
     if r.returncode:
         und = sorted(set(re.findall(r'undefined symbol: (\S+)', r.stderr)))
         print(f'[RED] link failed: {len(und)} undefined symbol(s)', flush=True)
@@ -180,6 +224,30 @@ def main():
         sys.exit(1)
     print(f'linked {exe} ({os.path.getsize(exe) / 1048576:.1f} MB)')
     app_libs(cc, target, exe)
+
+
+def cxx(cc):   # the NDK's clang++ next to its clang
+    d, b = os.path.split(cc); return os.path.join(d, b.replace('clang', 'clang++', 1))
+
+
+def adreno_hooks(cc, target):
+    """libadrenotools' hook libraries (dm/third_party/libadrenotools/src/hook), which its loader finds in the app's native library folder (DM_HOOK_DIR): the custom-driver
+    hook libmain_hook.so with its implementation libhook_impl.so, and the two optional hooks it may load (file redirection, GPU memory import). Built as its CMake does"""
+    adt = os.path.join(DM, 'third_party', 'libadrenotools'); hk = os.path.join(adt, 'src', 'hook'); lnb = os.path.join(adt, 'lib', 'linkernsbypass')
+    common = target + ['-shared', '-fPIC', '-O2', '-g', '-Wall', '-I' + os.path.join(adt, 'include'), '-I' + lnb]
+    impl = os.path.join(OUT, 'libhook_impl.so'); out = [impl]
+    jobs = [(impl, [cxx(cc)] + common + ['-std=c++20', '-fvisibility=hidden', '-static-libstdc++', '-o', impl, os.path.join(hk, 'hook_impl.cpp'), os.path.join(lnb, 'android_linker_ns.cpp'),
+                                          os.path.join(lnb, 'elf_soname_patcher.cpp'), '-Wl,-soname,libhook_impl.so', '-landroid', '-ldl', '-llog'], [os.path.join(hk, 'hook_impl.cpp')])]
+    for name in ('main_hook', 'file_redirect_hook', 'gsl_alloc_hook'):
+        so = os.path.join(OUT, f'lib{name}.so'); out.append(so)
+        jobs.append((so, [cc] + common + ['-o', so, os.path.join(hk, f'{name}.c'), '-Wl,-soname,' + os.path.basename(so), '-Wl,-z,global', impl, '-ldl', '-llog'], [os.path.join(hk, f'{name}.c')]))
+    for so, cmd, srcs in jobs:
+        deps = srcs + glob.glob(os.path.join(hk, '*.h')) + [os.path.abspath(__file__)]
+        if os.path.exists(so) and os.path.getmtime(so) >= max(os.path.getmtime(d) for d in deps): continue
+        r = subprocess.run(cmd, capture_output=True, text=True, encoding='utf-8', errors='replace')
+        if r.returncode: print(r.stderr[-3000:]); sys.exit(f'[RED] {os.path.basename(so)} failed to build')
+        print(f'built {so}')
+    return out
 
 
 def app_libs(cc, target, exe):
@@ -193,7 +261,8 @@ def app_libs(cc, target, exe):
                            capture_output=True, text=True, encoding='utf-8', errors='replace')
         if r.returncode: print(r.stderr[-3000:]); sys.exit('[RED] libdmfront.so failed to build')
         print(f'built {so}')
-    for a, b in ((exe, 'libdmhost.so'), (so, 'libdmfront.so')):
+    hooks = adreno_hooks(cc, target)
+    for a, b in [(exe, 'libdmhost.so'), (so, 'libdmfront.so')] + [(h, os.path.basename(h)) for h in hooks]:
         d = os.path.join(jni, b)
         if not os.path.exists(d) or os.path.getmtime(d) < os.path.getmtime(a): shutil.copy2(a, d); print(f'copied to the app: {d}')
 

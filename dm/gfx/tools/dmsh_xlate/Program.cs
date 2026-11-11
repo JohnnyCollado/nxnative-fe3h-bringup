@@ -137,6 +137,21 @@ static class SwshXlate
         public bool QueryHostSupportsDepthClipControl() => false;   // Metal has no -1..1 clip control; the depth convention is not left to the translator, the rewrite is added per entry point in the MSL (see the file header)
         // Job reduced = true: relaxed precision - the translator marks NoContraction only on operations that must be exact (the default marks all: keeps the bit-exact results of Maxwell's separate rounding, at the cost of many optimization-disabled spvFMul etc. in the MSL)
         public bool QueryHostReducedPrecision() => _job["reduced"] is JsonNode n && (bool)n;
+        // Job "sb_align" (the Android chain, vk_spirv.py SB_ALIGN): the alignment the host binds storage buffers at. A global memory access becomes a storage buffer access at
+        // address - (buffer address & -alignment), so the replay must bind from exactly that boundary (Vulkan binds at a multiple of the device's minStorageBufferOffsetAlignment,
+        // 64 on the Adreno; Metal at the address itself, the default 16 here). With 16 against the Adreno's 64, a buffer between two 64-byte boundaries was read shifted by up to
+        // 48 bytes and written early (Fire Emblem Fortune's Weave's battles: "a storage buffer ... is not 64-byte aligned ... reads shifted", and black blocks; the same fix as
+        // shirai91/nx2android's, where Xenoblade Chronicles 3's movie showed stripes and an early write broke the game's heap). GlobalToStorage's inline accesses take that form only
+        // when the buffers are "unaligned"; otherwise they index from the buffer address itself. Jobs without it (every Apple job) answer as before
+        public int QueryHostStorageBufferOffsetAlignment() => _job["sb_align"] is JsonNode n ? (int)n : 16;
+        public bool QueryHasUnalignedStorageBuffer() => _job["sb_align"] != null;
+        // Job gather_bias (vk_spirv.py): texture gathers get a 1 / (size * 2^(n+1)) coordinate nudge, n = 8 being Eden's 1/512 texel; Adreno rounds a coordinate at a texel
+        // centre to the other 2x2 block than Maxwell (Lemon 8d62cd2dc038). Jobs without it (every Apple job) answer 0 as before
+        // Job subgroup (vk_spirv.py SUBGROUP): the host's subgroup size. Above 32 the translator emulates Maxwell's 32-lane warps inside it (lane id & 31, the ballot word of
+        // the lane's own 32, shuffles inside its 32); Adreno runs 64 or 128 lanes, the driver's choice per pipeline. At 32 (Ryujinx's default, every Apple job) lanes past 32
+        // read the wrong lanes. As shirai91/nx2android's Program.cs and shader_vk.py (android_subgroup_size 128)
+        public int QueryHostSubgroupSize() => _job["subgroup"] is JsonNode n ? (int)n : 32;
+        public int QueryHostGatherBiasPrecision() => _job["gather_bias"] is JsonNode n ? (int)n : 0;
         // Job softfloat64 = true: the host has no FP64, so Ryujinx's DoubleToFloat pass lowers double operations to float (Metal has no double type). Set only on the retry of a
         // shader whose first translation declared a 64-bit float (see Main): answering "no" for every shader would also drop the Float64 capability from all the others
         public bool QueryHostSupportsShaderFloat64() => !(_job["softfloat64"] is JsonNode n && (bool)n);

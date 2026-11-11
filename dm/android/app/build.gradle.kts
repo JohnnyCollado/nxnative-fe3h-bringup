@@ -12,7 +12,11 @@ android {
         targetSdk = 35
         versionCode = 1
         versionName = "0.1"
+        // the launcher icon: game art kept out of the repository (art_res/ is git-ignored, filled on the build machine: mipmap-*/ic_launcher.png). Without it the
+        // app takes Android's default icon, so a fresh checkout still builds
+        manifestPlaceholders["appIcon"] = if (file("art_res/mipmap-mdpi/ic_launcher.png").isFile) "@mipmap/ic_launcher" else "@android:drawable/sym_def_app_icon"
     }
+    sourceSets["main"].res.srcDirs("art_res")
     buildTypes {
         release { isMinifyEnabled = false }
     }

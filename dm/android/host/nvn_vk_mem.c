@@ -18,7 +18,7 @@
 #include <string.h>
 #include <sys/mman.h>
 #include <unistd.h>
-#include <vulkan/vulkan.h>
+#include "volk.h"   // Vulkan through function pointers from the chosen driver (vk_driver.c)
 #include "nvn_vk.h"
 
 #define VLOG(...) do { flockfile(stderr); fprintf(stderr, "[dm] [vk] " __VA_ARGS__); fputc('\n', stderr); funlockfile(stderr); } while (0)
@@ -28,11 +28,14 @@ static pthread_once_t g_vk_once = PTHREAD_ONCE_INIT;
 
 static int has_ext(const VkExtensionProperties *e, uint32_t n, const char *name) { for (uint32_t i = 0; i < n; i++) if (!strcmp(e[i].extensionName, name)) return 1; return 0; }
 
+int vk_driver_load(void); const char *vk_driver_desc(void);   // vk_driver.c
 static void vk_init_once(void) {
+    if (!vk_driver_load()) { VLOG("[RED] no Vulkan driver: pools stay in ordinary memory"); return; }
     VkApplicationInfo app = {VK_STRUCTURE_TYPE_APPLICATION_INFO, NULL, "nxnative", 1, "nxnative", 1, VK_API_VERSION_1_3};
     VkInstanceCreateInfo ici = {VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO, NULL, 0, &app};
     VkResult r = vkCreateInstance(&ici, NULL, &g_vk.inst);
     if (r) { VLOG("[RED] vkCreateInstance failed (%d): no Vulkan device, pools stay in ordinary memory", r); return; }
+    volkLoadInstance(g_vk.inst);
     uint32_t n = 1; if (vkEnumeratePhysicalDevices(g_vk.inst, &n, &g_vk.pd) < 0 || !n) { VLOG("[RED] no Vulkan physical device"); return; }
     VkPhysicalDeviceProperties p; vkGetPhysicalDeviceProperties(g_vk.pd, &p);
     vkGetPhysicalDeviceMemoryProperties(g_vk.pd, &g_vk.mp);
@@ -81,7 +84,7 @@ static void vk_init_once(void) {
     VkPhysicalDeviceVulkan12Features f12 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES, &f13};
     f12.timelineSemaphore = h12.timelineSemaphore; f12.shaderFloat16 = h12.shaderFloat16; f12.shaderInt8 = h12.shaderInt8; f12.scalarBlockLayout = h12.scalarBlockLayout;
     f12.descriptorIndexing = h12.descriptorIndexing; f12.runtimeDescriptorArray = h12.runtimeDescriptorArray; f12.descriptorBindingPartiallyBound = h12.descriptorBindingPartiallyBound;
-    f12.drawIndirectCount = h12.drawIndirectCount; f12.shaderSubgroupExtendedTypes = h12.shaderSubgroupExtendedTypes;
+    f12.drawIndirectCount = h12.drawIndirectCount; f12.hostQueryReset = h12.hostQueryReset; g_vk.host_qreset = h12.hostQueryReset; f12.shaderSubgroupExtendedTypes = h12.shaderSubgroupExtendedTypes;
     f12.uniformAndStorageBuffer8BitAccess = h12.uniformAndStorageBuffer8BitAccess; f12.storageBuffer8BitAccess = h12.storageBuffer8BitAccess;
     // the same extension structs, now asking for what the query found (vkGetPhysicalDeviceFeatures2 filled them in place)
     VkPhysicalDeviceVertexInputDynamicStateFeaturesEXT fvi = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_INPUT_DYNAMIC_STATE_FEATURES_EXT, NULL, hvi.vertexInputDynamicState};
@@ -95,6 +98,16 @@ static void vk_init_once(void) {
     LINK(x_vi, fvi) LINK(x_rb, frb) LINK(x_dc, fdc) LINK(x_u8, fu8) LINK(x_cb, fcb) LINK(x_dv, fdv)
 #undef LINK
     f13.pNext = fchain;
+    {   // Subgroup size: the compute shaders that pass values between threads (Maxwell / Ampere warps of 32 lanes) are translated for 64-lane subgroups. Qualcomm's driver
+        // runs 64; a driver whose size varies (Turnip: 64-128) is told 64 per compute pipeline (nvn_vk_draw.c cpipe_of), when it lets the compute stage be pinned
+        VkPhysicalDeviceVulkan13Properties q13 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_PROPERTIES}; VkPhysicalDeviceVulkan11Properties q11 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_PROPERTIES, &q13};
+        VkPhysicalDeviceProperties2 q2 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &q11}; vkGetPhysicalDeviceProperties2(g_vk.pd, &q2);
+        g_vk.sg_size = q11.subgroupSize; g_vk.sg_min = q13.minSubgroupSize ? q13.minSubgroupSize : q11.subgroupSize; g_vk.sg_max = q13.maxSubgroupSize ? q13.maxSubgroupSize : q11.subgroupSize;
+        f13.subgroupSizeControl = h13.subgroupSizeControl; f13.computeFullSubgroups = h13.computeFullSubgroups; g_vk.sg_full = h13.computeFullSubgroups;   // sg_full: nvn_vk_sgprobe.c
+        g_vk.sg_pin_cs = h13.subgroupSizeControl && (q13.requiredSubgroupSizeStages & VK_SHADER_STAGE_COMPUTE_BIT) && g_vk.sg_min <= 64 && g_vk.sg_max >= 64 && (g_vk.sg_min != g_vk.sg_max || g_vk.sg_size != 64);
+        VLOG("subgroups: %u lanes (%u-%u), operations %#x in stages %#x; compute pipelines %s", q11.subgroupSize, g_vk.sg_min, g_vk.sg_max, q11.subgroupSupportedOperations, q11.subgroupSupportedStages,
+             g_vk.sg_pin_cs ? "pinned to 64" : g_vk.sg_size == 64 || g_vk.sg_size == 32 ? "as the device runs them (right for shaders translated for 64)" : "[RED] not 64 and not pinnable: warp shaders read the wrong lanes");
+    }
     g_vk.vi_dyn = x_vi && hvi.vertexInputDynamicState; g_vk.null_desc = x_rb && hrb.nullDescriptor; g_vk.clip_ctl = x_dc && hdc.depthClipControl;
     g_vk.idx_u8 = x_u8 && hu8.indexTypeUint8; g_vk.border = x_cb && hcb.customBorderColors && hcb.customBorderColorWithoutFormat; g_vk.divisor = x_dv && hdv.vertexAttributeInstanceRateDivisor;
     g_vk.lim = p.limits;
@@ -104,6 +117,7 @@ static void vk_init_once(void) {
     VkDeviceCreateInfo dci = {VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, &f11, 0, 1, &dqi, 0, NULL, non, on, &f};
     r = vkCreateDevice(g_vk.pd, &dci, NULL, &g_vk.dev);
     if (r) { VLOG("[RED] vkCreateDevice failed (%d): pools stay in ordinary memory", r); g_vk.dev = VK_NULL_HANDLE; return; }
+    volkLoadDevice(g_vk.dev);   // device functions straight from the driver, without the loader's dispatch
     vkGetDeviceQueue(g_vk.dev, g_vk.qfam, 0, &g_vk.q);
     // The pool memory type: host visible and coherent (the CPU and the GPU see each other's writes without flushes), cached when there is one (the game reads pools on the CPU)
     g_vk.pool_type = ~0u;
@@ -116,8 +130,13 @@ static void vk_init_once(void) {
     VLOG("features: vertex input dynamic state %d, null descriptors %d, depth clip control %d, 8-bit indices %d, border colours %d, divisors %d; alignment uniform %llu storage %llu, uniform range %u",
          g_vk.vi_dyn, g_vk.null_desc, g_vk.clip_ctl, g_vk.idx_u8, g_vk.border, g_vk.divisor, (unsigned long long)g_vk.lim.minUniformBufferOffsetAlignment,
          (unsigned long long)g_vk.lim.minStorageBufferOffsetAlignment, g_vk.lim.maxUniformBufferRange);
+    VkPhysicalDeviceDriverProperties dp = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES}; VkPhysicalDeviceProperties2 p2 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &dp};
+    vkGetPhysicalDeviceProperties2(g_vk.pd, &p2);
+    VLOG("driver: %s %s (driver id %d, conformance %u.%u.%u), loaded as %s", dp.driverName, dp.driverInfo, dp.driverID, dp.conformanceVersion.major, dp.conformanceVersion.minor,
+         dp.conformanceVersion.subminor, vk_driver_desc());
     VLOG("device: %s, Vulkan %u.%u.%u, %u device extensions on; pool memory type %u (flags %#x)", p.deviceName, VK_API_VERSION_MAJOR(p.apiVersion), VK_API_VERSION_MINOR(p.apiVersion),
          VK_API_VERSION_PATCH(p.apiVersion), non, g_vk.pool_type, g_vk.pool_type == ~0u ? 0 : g_vk.mp.memoryTypes[g_vk.pool_type].propertyFlags);
+    void vkx_sg_probe(void); vkx_sg_probe();   // how the driver groups compute threads into subgroups, against what the warp shaders assume (nvn_vk_sgprobe.c)
 }
 int vk_ready(void) { pthread_once(&g_vk_once, vk_init_once); return g_vk.ok; }
 
@@ -212,6 +231,23 @@ int vk_pool_find(uint64_t addr, uint64_t len, VkBuffer *buf, uint64_t *off) {
         if (addr < (uint64_t)(uintptr_t)p->mem) hi = m - 1;
         else if (addr >= (uint64_t)(uintptr_t)p->mem + p->size) lo = m + 1;
         else { if (addr + len <= (uint64_t)(uintptr_t)p->mem + p->size) { *buf = p->buf; *off = addr - (uint64_t)(uintptr_t)p->mem; ok = 1; } break; }
+    }
+    pthread_rwlock_unlock(&g_pools_mu);
+    return ok;
+}
+// As vk_pool_find, but a range that starts inside a pool and runs past its end resolves too, *avail being the bytes from addr to the pool's end (the whole len when it fits).
+// 0 when addr is in no pool. NVN binds uniform buffers and vertex streams with a size the shader need not read to its end; a binding near a pool's end (a ring buffer's
+// position moves each frame) must not lose its data
+int vk_pool_find_part(uint64_t addr, uint64_t len, VkBuffer *buf, uint64_t *off, uint64_t *avail) {
+    int ok = 0;
+    pthread_rwlock_rdlock(&g_pools_mu);
+    int lo = 0, hi = g_npools - 1;
+    while (lo <= hi) {
+        int m = (lo + hi) / 2; const vk_pool *p = &g_pools[m];
+        uint64_t base = (uint64_t)(uintptr_t)p->mem, end = base + p->size;
+        if (addr < base) hi = m - 1;
+        else if (addr >= end) lo = m + 1;
+        else { *buf = p->buf; *off = addr - base; *avail = addr + len <= end ? len : end - addr; ok = 1; break; }
     }
     pthread_rwlock_unlock(&g_pools_mu);
     return ok;

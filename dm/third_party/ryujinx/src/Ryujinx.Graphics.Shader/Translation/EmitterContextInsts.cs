@@ -878,6 +878,73 @@ namespace Ryujinx.Graphics.Shader.Translation
             return context.Add(Instruction.ShuffleUp, (Local(), Local()), a, b, c);
         }
 
+        // nxnative: quad operations for a pixel shader's in-quad SHFL (b: the lane 0..3, or the swap direction 0 horizontal, 1 vertical, 2 diagonal; a constant)
+        public static Operand QuadBroadcast(this EmitterContext context, Operand a, Operand b)
+        {
+            return context.Add(Instruction.QuadBroadcast, Local(), a, b);
+        }
+
+        public static Operand SubgroupBroadcast(this EmitterContext context, Operand a, Operand b)
+        {
+            return context.Add(Instruction.SubgroupBroadcast, Local(), a, b);
+        }
+
+        // nxnative: the value of lane 0..31 of this thread's own 32-lane warp, on a host whose subgroups hold several warps (Adreno: 64 lanes, two warps). Written
+        // with broadcasts, whose lane is a constant: one per warp of the subgroup, the thread's own chosen by its lane id. A shuffle with a computed lane (the warp's
+        // first lane + the lane) is what this replaces: Qualcomm's driver does not run those right (Eden marks them has_broken_spirv_subgroup_shuffle and lowers them
+        // the same way, emit_spirv_warp.cpp ShuffleAbsolute); Fire Emblem Fortune's Weave's light culling and exposure shaders came out dark with them. A lane that is
+        // not a constant takes a select over the 32 lanes (constant folding reduces it when the lane becomes one). At 32 lanes (Metal) it is the plain shuffle
+        public static Operand WarpGather(this EmitterContext context, Operand value, Operand lane, int subgroupSize)
+        {
+            if (subgroupSize <= 32)
+            {
+                return context.Shuffle(value, lane);
+            }
+
+            int warps = subgroupSize / 32;
+            Operand warp = context.ShiftRightU32(context.Load(StorageKind.Input, IoVariable.SubgroupLaneId), Const(5));
+
+            Operand OfLane(int l)
+            {
+                Operand r = context.SubgroupBroadcast(value, Const(l));
+
+                for (int s = 1; s < warps; s++)
+                {
+                    r = context.ConditionalSelect(context.ICompareEqual(warp, Const(s)), context.SubgroupBroadcast(value, Const(l + 32 * s)), r);
+                }
+
+                return r;
+            }
+
+            if (lane.Type == OperandType.Constant)
+            {
+                return OfLane(lane.Value & 31);
+            }
+
+            Operand res = OfLane(0);
+
+            for (int l = 1; l < 32; l++)
+            {
+                res = context.ConditionalSelect(context.ICompareEqual(lane, Const(l)), OfLane(l), res);
+            }
+
+            return res;
+        }
+
+        public static Operand SubgroupReduce(this EmitterContext context, Operand a, int op)
+        {
+            Operand dest = Local();
+
+            context.Add(new Operation(Instruction.SubgroupReduce, op, dest, a));
+
+            return dest;
+        }
+
+        public static Operand QuadSwap(this EmitterContext context, Operand a, Operand b)
+        {
+            return context.Add(Instruction.QuadSwap, Local(), a, b);
+        }
+
         public static Operand ShuffleXor(this EmitterContext context, Operand a, Operand b)
         {
             return context.Add(Instruction.ShuffleXor, Local(), a, b);

@@ -1,0 +1,29 @@
+#version 450
+// Subgroup layout probe (nvn_vk_sgprobe.c): what each thread of a work group sees of its subgroup, and the two forms the translated warp shaders use
+// (dm/third_party/ryujinx: InstEmitAmpereTensor.ARedux, EmitterContextInsts.WarpGather), so the host can check them against the guest's warps of 32 consecutive threads.
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_ballot : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+layout(local_size_x_id = 0, local_size_y_id = 1, local_size_z = 1) in;
+layout(std430, set = 0, binding = 0) buffer O { uint o[]; };
+void main() {
+    uint i = gl_LocalInvocationIndex, lane = gl_SubgroupInvocationID, warp = lane >> 5;
+    uint base = (gl_WorkGroupID.x * 256 + i) * 12;
+    uvec4 b = subgroupBallot(true);
+    o[base + 0] = lane; o[base + 1] = gl_SubgroupSize; o[base + 2] = subgroupBroadcastFirst(i);
+    o[base + 3] = bitCount(b.x) + bitCount(b.y) + bitCount(b.z) + bitCount(b.w);
+    uint s0 = subgroupAdd(warp == 0 ? i : 0), s1 = subgroupAdd(warp == 1 ? i : 0);                 // REDUX sum, one reduction per warp
+    o[base + 4] = warp == 0 ? s0 : s1;
+    uint g0 = subgroupBroadcast(i, 5), g1 = subgroupBroadcast(i, 37);                              // SHFL from lane 5 of the thread's warp
+    o[base + 5] = warp == 0 ? g0 : g1;
+    o[base + 6] = gl_NumSubgroups; o[base + 7] = gl_SubgroupID;
+    uint m0 = subgroupMin(warp == 0 ? i : 0xffffffffu), m1 = subgroupMin(warp == 1 ? i : 0xffffffffu);
+    o[base + 8] = warp == 0 ? m0 : m1;
+    o[base + 9] = 0xdead0000u; o[base + 10] = 0; o[base + 11] = 0x600d;
+    if ((i & 3) != 0) {                                                                            // the same reduction with a quarter of the lanes inactive
+        uint d0 = subgroupAdd(warp == 0 ? i : 0), d1 = subgroupAdd(warp == 1 ? i : 0);
+        o[base + 9] = warp == 0 ? d0 : d1;
+        uvec4 c = subgroupBallot(true);
+        o[base + 10] = bitCount(c.x) + bitCount(c.y) + bitCount(c.z) + bitCount(c.w);
+    }
+}

@@ -13,6 +13,20 @@ namespace Ryujinx.Graphics.Shader.Instructions
     // positions: Mesa NAK sm70_encode.rs (OpHmma, OpLdsm, OpMovm, OpHSetP2, OpHSet2, OpHMnMx2).
     static partial class InstEmit
     {
+        // nxnative: a lane of this thread's own 32-lane warp. The emulation above names lanes 0..31 of the warp (ALaneId is the lane within it); a host subgroup wider
+        // than 32 (Adreno: 64 or 128, Program.cs QueryHostSubgroupSize) holds several warps, so the lane is offset by the warp's first lane, and the active lanes are that
+        // warp's ballot word (EmitBallot). At 32 (Metal) both are as before. Written for 32 only, warps past the first reduced, matched and multiplied the first warp's
+        // values: Fire Emblem Fortune's Weave's tile depth bounds (REDUX min / max / sum, a0c632d8b5fa925b) on the Odin 3
+        private static Operand AShuffle(EmitterContext context, Operand value, Operand lane)
+        {
+            if (context.TranslatorContext.GpuAccessor.QueryHostSubgroupSize() <= 32)
+            {
+                return context.Shuffle(value, lane);
+            }
+
+            return context.WarpGather(value, lane, context.TranslatorContext.GpuAccessor.QueryHostSubgroupSize());   // broadcasts: a computed lane is not shuffled right by Qualcomm's driver
+        }
+
         public static void RegisterAmpereTensor(AmpereRegistrar x)
         {
             const InstProps N = InstProps.None;
@@ -37,12 +51,40 @@ namespace Ryujinx.Graphics.Shader.Instructions
             }
 
             Operand src = AGpr(x.Ra);
-            Operand active = context.Ballot(Const(IrConsts.True), 0);
+            int subgroupSize = context.TranslatorContext.GpuAccessor.QueryHostSubgroupSize();
+
+            // nxnative: on a host subgroup of several warps (Adreno: 64), one subgroup reduction per warp: the lanes of the other warps give the operation's identity,
+            // and each lane takes its own warp's result. Inactive lanes take no part in a subgroup reduction, as in REDUX. The per-lane form below cost 32 broadcasts and
+            // 32 selects per warp per REDUX: Fire Emblem Fortune's Weave's light culling (35d12d6f..., 10 REDUX) then ran 150-212 ms a dispatch on the Odin 3 and the
+            // driver lost the device. Needs VK_SUBGROUP_FEATURE_ARITHMETIC_BIT (Adreno 830: yes; clustered reductions, which would do it in one, no)
+            if (subgroupSize > 32)
+            {
+                int identity = op == 0 ? -1 : op == 4 ? (signed ? int.MaxValue : -1) : op == 5 && signed ? int.MinValue : 0;
+                int rop = op < 4 ? op : (signed ? op : op + 2);
+                Operand warp = context.ShiftRightU32(context.Load(StorageKind.Input, IoVariable.SubgroupLaneId), Const(5));
+                Operand res = null;
+
+                for (int s = 0; s < subgroupSize / 32; s++)
+                {
+                    Operand mine = context.ICompareEqual(warp, Const(s));
+                    Operand r = context.SubgroupReduce(context.ConditionalSelect(mine, src, Const(identity)), rop);
+                    res = res == null ? r : context.ConditionalSelect(mine, r, res);
+                }
+
+                if (x.Rd != RegisterConsts.UniformZeroIndex)
+                {
+                    context.Copy(Register(x.Rd, RegisterType.Uniform), res);
+                }
+
+                return;
+            }
+
+            Operand active = EmitBallot(context, Const(IrConsts.True));
             Operand acc = null;
 
             for (int lane = 0; lane < 32; lane++)
             {
-                Operand v = context.Shuffle(src, Const(lane));
+                Operand v = AShuffle(context, src, Const(lane));
                 Operand r = acc == null ? v : op switch
                 {
                     0 => context.BitwiseAnd(acc, v),
@@ -72,16 +114,16 @@ namespace Ryujinx.Graphics.Shader.Instructions
             AmpereOp x = new(context.CurrOp);
             bool u64 = x.Bit(73), any = x.Bit(79);
             Operand lo = AGpr(x.Ra), hi = u64 ? AGpr(x.Ra + 1) : null;
-            Operand active = context.Ballot(Const(IrConsts.True), 0);
+            Operand active = EmitBallot(context, Const(IrConsts.True));
             Operand same = Const(0);
 
             for (int lane = 0; lane < 32; lane++)
             {
-                Operand eq = context.ICompareEqual(context.Shuffle(lo, Const(lane)), lo);
+                Operand eq = context.ICompareEqual(AShuffle(context, lo, Const(lane)), lo);
 
                 if (u64)
                 {
-                    eq = context.BitwiseAnd(eq, context.ICompareEqual(context.Shuffle(hi, Const(lane)), hi));
+                    eq = context.BitwiseAnd(eq, context.ICompareEqual(AShuffle(context, hi, Const(lane)), hi));
                 }
 
                 same = context.BitwiseOr(same, context.ConditionalSelect(eq, Const(1 << lane), Const(0)));
@@ -183,7 +225,7 @@ namespace Ryujinx.Graphics.Shader.Instructions
 
                 for (int r = 0; r < aRegs; r++)
                 {
-                    Operand v = context.Shuffle(AGpr(x.Ra + r), src);
+                    Operand v = AShuffle(context, AGpr(x.Ra + r), src);
                     int row = r & 1, kb = (r >> 1) * 8 + 2 * j;
                     a[row, kb] = AHalf(context, v, 0);
                     a[row, kb + 1] = AHalf(context, v, 1);
@@ -203,7 +245,7 @@ namespace Ryujinx.Graphics.Shader.Instructions
 
                     for (int r = 0; r < bRegs; r++)
                     {
-                        Operand v = context.Shuffle(AGpr(x.Rb + r), src);
+                        Operand v = AShuffle(context, AGpr(x.Rb + r), src);
                         int kb = r * 8 + 2 * j;
                         b[c, kb] = AHalf(context, v, 0);
                         b[c, kb + 1] = AHalf(context, v, 1);
@@ -265,7 +307,7 @@ namespace Ryujinx.Graphics.Shader.Instructions
             {
                 if (mode == 0)
                 {
-                    Operand rowAddr = context.Shuffle(addr, context.IAdd(g, Const(8 * m)));
+                    Operand rowAddr = AShuffle(context, addr, context.IAdd(g, Const(8 * m)));
                     Operand byteOffset = context.IAdd(rowAddr, context.ShiftLeft(t, Const(2)));
                     results[m] = context.Load(StorageKind.SharedMemory, id, context.ShiftRightU32(byteOffset, Const(2)));
                 }
@@ -276,7 +318,7 @@ namespace Ryujinx.Graphics.Shader.Instructions
                     for (int j = 0; j < 2; j++)
                     {
                         Operand row = context.IAdd(context.ShiftLeft(t, Const(1)), Const(j));
-                        Operand rowAddr = context.Shuffle(addr, context.IAdd(row, Const(8 * m)));
+                        Operand rowAddr = AShuffle(context, addr, context.IAdd(row, Const(8 * m)));
                         Operand byteOffset = context.IAdd(rowAddr, context.ShiftLeft(g, Const(1)));
                         Operand word = context.Load(StorageKind.SharedMemory, id, context.ShiftRightU32(byteOffset, Const(2)));
                         h[j] = context.BitfieldExtractU32(word, context.ShiftLeft(context.BitwiseAnd(byteOffset, Const(2)), Const(3)), Const(16));
@@ -312,7 +354,7 @@ namespace Ryujinx.Graphics.Shader.Instructions
             {
                 // out (r, c = 2t + j) = in (c, r): held by lane 4c + r / 2, half r % 2
                 Operand c = context.IAdd(context.ShiftLeft(t, Const(1)), Const(j));
-                Operand v = context.Shuffle(src, context.IAdd(context.ShiftLeft(c, Const(2)), context.ShiftRightU32(r, Const(1))));
+                Operand v = AShuffle(context, src, context.IAdd(context.ShiftLeft(c, Const(2)), context.ShiftRightU32(r, Const(1))));
                 h[j] = context.BitfieldExtractU32(v, context.ShiftLeft(context.BitwiseAnd(r, Const(1)), Const(4)), Const(16));
             }
 

@@ -17,11 +17,12 @@
 #include <sys/un.h>
 #include <time.h>
 #include <unistd.h>
-#include <vulkan/vulkan.h>
+#include "volk.h"   // Vulkan through function pointers from the chosen driver (vk_driver.c)
 #include "dm_front_proto.h"
 #include "nvn_vk_int.h"
 
 void dm_pad_set(uint64_t buttons, int32_t lx, int32_t ly, int32_t rx, int32_t ry);   // hle_hid.c
+void dm_background(int on); void dm_set_opmode(int m);   // hle_oe.c
 
 enum { FB_FREE, FB_DRAWING, FB_SHOWN };
 typedef struct { AHardwareBuffer *ahb; VkImage img; VkDeviceMemory mem; VkImageView view, src; VkFence fence; VkCommandBuffer cb; VkDescriptorSet ds; int state; } fbuf;
@@ -29,18 +30,39 @@ static fbuf B[DMF_MAX_BUFFERS]; static int g_nb; static uint32_t g_w, g_h;
 static int g_fd = -1, g_dead; static time_t g_try_at;
 static pthread_mutex_t g_mu = PTHREAD_MUTEX_INITIALIZER; static pthread_cond_t g_cv = PTHREAD_COND_INITIALIZER;
 static int g_queue[16]; static int g_qn;   // buffers drawn on the GPU, waiting for their fence (the sender thread)
+static pthread_cond_t g_text_cv = PTHREAD_COND_INITIALIZER;   // the guest thread waiting for the app's text answer (vkd_front_text)
+static int g_text_done, g_text_ok; static char g_text_ans[DMF_TEXT_TEXT];
 static VkCommandPool g_cp; static VkDescriptorPool g_dp; static VkPipeline g_pipe; static VkPipelineLayout g_pl; static VkDescriptorSetLayout g_dsl; static VkSampler g_samp;
 static uint64_t g_shown, g_dropped;
 
 static int send_msg(const dmf_msg *m) { return send(g_fd, m, sizeof *m, MSG_NOSIGNAL) == (ssize_t)sizeof *m; }
+static int send_raw(const void *p, size_t n) { return g_fd >= 0 && send(g_fd, p, n, MSG_NOSIGNAL) == (ssize_t)n; }
 static void *reader(void *unused) {
     (void)unused;
+    union { dmf_msg m; dmf_text_msg t; } rb;   // the text messages are much bigger than dmf_msg
     for (;;) {
-        dmf_msg m; ssize_t n = recv(g_fd, &m, sizeof m, 0);
-        if (n <= 0) { VLOG("the app's screen closed the link (%s): frames are no longer shown", n ? strerror(errno) : "closed"); pthread_mutex_lock(&g_mu); g_dead = 1; pthread_mutex_unlock(&g_mu); return NULL; }
-        if (n != (ssize_t)sizeof m) continue;
+        ssize_t n = recv(g_fd, &rb, sizeof rb, 0);
+        if (n <= 0) { VLOG("the app's screen closed the link (%s): frames are no longer shown", n ? strerror(errno) : "closed");
+                      pthread_mutex_lock(&g_mu); g_dead = 1; pthread_cond_broadcast(&g_text_cv); pthread_mutex_unlock(&g_mu); return NULL; }
+        if (rb.m.type == DMF_TEXT_DONE) {   // the app's user answered the game's keyboard: hand it to the waiting guest thread
+            if (n < (ssize_t)sizeof(rb.t)) continue;
+            pthread_mutex_lock(&g_mu);
+            if (!g_text_done) {   // an answer nobody waits for is dropped
+                g_text_ok = rb.t.ok ? 1 : 0;
+                if (g_text_ok) { strncpy(g_text_ans, rb.t.text, sizeof g_text_ans - 1); g_text_ans[sizeof g_text_ans - 1] = 0; }
+                g_text_done = 1; pthread_cond_broadcast(&g_text_cv);
+            }
+            pthread_mutex_unlock(&g_mu);
+            continue;
+        }
+        if (n != (ssize_t)sizeof(rb.m)) continue;
+        dmf_msg m = rb.m;
         if (m.type == DMF_RELEASE && m.index < (uint32_t)g_nb) { pthread_mutex_lock(&g_mu); if (B[m.index].state == FB_SHOWN) B[m.index].state = FB_FREE; pthread_mutex_unlock(&g_mu); }
         else if (m.type == DMF_INPUT) dm_pad_set(m.buttons, m.lx, m.ly, m.rx, m.ry);
+        else if (m.type == DMF_PAUSE) {   // the pause menu: no input while it is open, then the trip to the background (it waits for the GPU work in flight)
+            static int paused; int on = m.index != 0;
+            if (on != paused) { paused = on; if (on) dm_pad_set(0, 0, 0, 0, 0); VLOG("pause menu %s", on ? "opened: the game goes to the background" : "closed: the game resumes"); dm_background(on); }
+        } else if (m.type == DMF_OPMODE) dm_set_opmode(m.index ? 1 : 0);
     }
 }
 static void *sender(void *unused) {
@@ -167,3 +189,23 @@ void vkd_front_present(vk_tex *x, const int crop[4]) {
     pthread_mutex_lock(&g_mu); if (g_qn < 16) g_queue[g_qn++] = i; pthread_cond_signal(&g_cv); pthread_mutex_unlock(&g_mu);
 }
 void vkd_front_stats(uint64_t *shown, uint64_t *dropped) { *shown = g_shown; *dropped = g_dropped; }
+
+// The game's keyboard (hle_swkbd.c) on the guest thread: the request crosses to the app, which shows its text box with the system keyboard, and the thread waits here
+// until the app's answer arrives through the reader. The game truncates the answer to max_chars (UTF-16 units) on the way back into its string anyway.
+int vkd_front_text(const char *title, const char *sub, const char *guide, const char *initial, int max_chars, int min_chars, char *out, int out_cap) {
+    if (!link_up()) return -1;
+    dmf_text_msg t; memset(&t, 0, sizeof t);
+    t.type = DMF_TEXT; t.max_chars = max_chars > 0 ? (uint32_t)max_chars : 0; t.min_chars = min_chars;
+    strncpy(t.title, title ? title : "", sizeof t.title - 1);
+    strncpy(t.sub, sub ? sub : "", sizeof t.sub - 1);
+    strncpy(t.guide, guide ? guide : "", sizeof t.guide - 1);
+    strncpy(t.initial, initial ? initial : "", sizeof t.initial - 1);
+    pthread_mutex_lock(&g_mu);
+    if (g_dead || !send_raw(&t, sizeof t)) { pthread_mutex_unlock(&g_mu); return -1; }
+    g_text_done = 0; g_text_ans[0] = 0;
+    while (!g_text_done) pthread_cond_wait(&g_text_cv, &g_mu);   // the reader sets g_text_done; it also wakes us when the link dies
+    int ok = g_text_ok;
+    if (ok && out && out_cap > 0) { size_t len = strlen(g_text_ans); if (len > (size_t)out_cap - 1) len = (size_t)out_cap - 1; memcpy(out, g_text_ans, len); out[len] = 0; }
+    pthread_mutex_unlock(&g_mu);
+    return ok ? 1 : 0;
+}
