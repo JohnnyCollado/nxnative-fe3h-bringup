@@ -13,7 +13,8 @@ class Settings(private val context: Context) {
     private val p: SharedPreferences = context.getSharedPreferences("settings", Context.MODE_PRIVATE)
 
     /** One setting: its choices as (value, label) (a function: the GPU drivers are whatever is installed), the value stored, and whether a change reaches a running game. */
-    class Choice(val key: String, val title: String, val choices: (Context) -> List<Pair<String, String>>, val default: String, val live: Boolean)
+    /** [list]: its choices have long names (the GPU drivers): the row opens a list of them in full instead of stepping left and right. */
+    class Choice(val key: String, val title: String, val choices: (Context) -> List<Pair<String, String>>, val default: String, val live: Boolean, val list: Boolean = false)
 
     companion object {
         private fun fixed(vararg c: Pair<String, String>): (Context) -> List<Pair<String, String>> = { c.toList() }
@@ -27,7 +28,7 @@ class Settings(private val context: Context) {
         // DM_AUDIO: 1 sound through AAudio (dm/android/host/dm_aaudio.c), 0 silent
         val SOUND = Choice("audio", "Sound", fixed("1" to "On", "0" to "Off"), "1", live = false)
         // DM_GPU_DRIVER: "" the system driver, else an installed driver's folder name (Drivers.kt); loaded through libadrenotools (dm/android/host/vk_driver.c)
-        val GPU_DRIVER = Choice("gpu_driver", "GPU driver", { c -> listOf("" to "System") + Drivers.list(c).map { it.folder.name to "${it.name} ${it.version}".trim() } }, "", live = false)
+        val GPU_DRIVER = Choice("gpu_driver", "GPU driver", { c -> listOf("" to "System") + Drivers.list(c).map { it.folder.name to "${it.name} ${it.version}".trim() } }, "", live = false, list = true)
         // the frame-rate counter in the game screen's corner: the game's finished frames a second (GameActivity, dmfront.c nativeFrames); app-side only
         val FPS_COUNTER = Choice("fps", "Frame-rate counter", fixed("0" to "Off", "1" to "On"), "0", live = true)
         // DM_FPS_TARGET stays 0, the game's own frame rate (30 in gameplay, 60 in menus). The host can write 60 into the game's target (dm/host/hle_fpslock.c), but the game

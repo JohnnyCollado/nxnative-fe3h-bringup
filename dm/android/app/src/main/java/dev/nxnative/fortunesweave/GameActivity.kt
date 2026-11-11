@@ -165,7 +165,7 @@ class GameActivity : Activity(), SurfaceHolder.Callback {
         }
         val right = FocusBox(this)
         val hint = TextView(this).apply { setTextSize(android.util.TypedValue.COMPLEX_UNIT_DIP, 12f); setTextColor(FeTheme.MUTED) }
-        nav = MenuNav(this, settings, right, MenuNav.placeholder(this, "Choose Settings or Controls"), hint, "D-pad move  ·  [A] select  ·  [B] resume")
+        nav = MenuNav(this, settings, right, MenuNav.placeholder(this, "Choose Settings or Controls"), hint, "[D] move  ·  [A] select  ·  [B] resume")
         panel = SettingsPanel(this, settings) { c, v -> if (c == Settings.CONSOLE_MODE) nativeOpmode(v.toInt()); if (c == Settings.FPS_COUNTER) showFps() }.apply { onEditChange = { nav.update() } }
         val settingsPage = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; addView(MenuNav.head(this@GameActivity, "SETTINGS")); addView(panel) }
         controls = ControlsPanel(this, settings).apply { onMappingChange = { nav.update() }; table.onEditChange = { nav.update() } }

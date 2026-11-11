@@ -55,6 +55,7 @@ class SettingsPanel(context: Context, private val settings: Settings, private va
             addView(value, LayoutParams(0, LayoutParams.MATCH_PARENT, 1f).apply { marginStart = FeTheme.dp(context, 8) })
             setOnTouchListener { _, e -> if (e.action == MotionEvent.ACTION_DOWN) tapX = e.x; false }
             setOnClickListener {
+                if (c.list) { tapX = -1f; pick(c); return@setOnClickListener }   // a list of the choices by their full names
                 if (tapX >= 0) { val back = tapX < width / 3f; tapX = -1f; change(c, if (back) -1 else 1) }   // touch: change at once
                 else { val was = edit; edit = if (was == c) null else c; was?.let { show(it) }; show(c); (parent as? View)?.let { notifyNav() } }   // controller: step in or out
             }
@@ -78,6 +79,16 @@ class SettingsPanel(context: Context, private val settings: Settings, private va
 
     override fun stopEdit() { val c = edit ?: return; edit = null; show(c); notifyNav() }
 
+    /** The drop-down of a [Settings.Choice.list] setting: every choice with its whole name, the current one marked; picking one stores it and closes the list.
+     *  With a controller the button that sends A picks and the one that sends B closes (FeTheme.keys). */
+    private fun pick(c: Settings.Choice) {
+        val all = c.choices(context); val now = all.indexOfFirst { it.first == settings[c] }
+        val d = android.app.AlertDialog.Builder(context, android.R.style.Theme_DeviceDefault_Dialog_Alert).setTitle(c.title)
+            .setSingleChoiceItems(all.map { it.second }.toTypedArray(), now) { dlg, which -> val v = all[which].first; settings[c] = v; show(c); onChange(c, v); dlg.dismiss() }
+            .create()
+        FeTheme.keys(d, settings).show()
+    }
+
     private fun change(c: Settings.Choice, by: Int) {
         val v = settings.step(c, by); settings[c] = v; show(c); onChange(c, v)
     }
@@ -90,7 +101,7 @@ class SettingsPanel(context: Context, private val settings: Settings, private va
         val ink = if (on) FeTheme.BRIGHT else FeTheme.INK
         r.name.setTextColor(ink); r.value.setTextColor(if (on) FeTheme.GOLD else ink)
         r.name.text = c.title + if (c.live) "" else " *"
-        r.value.text = if (on) "◀  " + settings.label(c) + "  ▶" else settings.label(c)
+        r.value.text = if (c.list) settings.label(c) + "  ▾" else if (on) "◀  " + settings.label(c) + "  ▶" else settings.label(c)
     }
 
     fun refresh() { for (c in rows.keys) show(c) }

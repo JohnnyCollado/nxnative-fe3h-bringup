@@ -1,7 +1,7 @@
 CONTROLLER BUTTON ICON ART — ATTRIBUTION
 ========================================
 
-The controller face-button icons in app/src/main/res/drawable-nodpi (ctl_ns_face_*, ctl_xb_face_*, ctl_ps_face_*)
+The controller button icons in app/src/main/res/drawable-nodpi (ctl_ns_*, ctl_xb_*, ctl_ps_*: the face buttons and the d-pad)
 come from Zacksly's button icon packs, taken as bundled in PlayFieldPortal (core-ui, same files).
 
   Author:   Zacksly
@@ -18,8 +18,8 @@ Packs in use (all "Buttons Solid / White / 128w"):
 
 Modification statement (required by the license):
   The artwork is UNMODIFIED — the bundled PNGs are byte-identical to the pack originals.
-  Only the file names were changed, to Android resource names, and just the four face buttons of
-  each pack are included.
+  Only the file names were changed, to Android resource names, and just the four face buttons and the
+  whole d-pad of each pack are included.
 
 Credit line, in the form the license asks for:
 

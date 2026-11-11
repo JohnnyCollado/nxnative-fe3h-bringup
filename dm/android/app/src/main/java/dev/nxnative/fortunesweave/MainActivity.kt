@@ -62,7 +62,7 @@ class MainActivity : Activity() {
         // the right side: one panel at a time, chosen on the left (Panels.kt)
         val right = FocusBox(this)
         val hint = TextView(this).apply { size(this, 12f); setTextColor(FeTheme.MUTED) }
-        nav = MenuNav(this, settings, right, MenuNav.placeholder(this, "Choose Settings, Controls or GPU drivers"), hint, "D-pad move  ·  [A] select").apply { backCloses = true }
+        nav = MenuNav(this, settings, right, MenuNav.placeholder(this, "Choose Settings, Controls or GPU drivers"), hint, "[D] move  ·  [A] select").apply { backCloses = true }
         panel = SettingsPanel(this, settings) { _, _ -> }.apply { onEditChange = { nav.update() } }
         losslessNote = MenuNav.note(this, losslessStatus())
         val settingsPage = LinearLayout(this).apply {

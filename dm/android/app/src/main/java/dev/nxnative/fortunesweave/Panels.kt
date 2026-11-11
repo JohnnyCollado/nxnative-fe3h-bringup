@@ -79,7 +79,7 @@ class MenuNav(private val context: Context, private val settings: Settings, priv
         val p = panel
         val t = when {
             p is Editable && p.editing -> "◀ ▶ change  ·  [A] or [B] done"
-            p != null && p.hasFocus() -> "D-pad move  ·  [A] select  ·  [B] back"
+            p != null && p.hasFocus() -> "[D] move  ·  [A] select  ·  [B] back"
             else -> leftHint
         }
         hint.text = FeTheme.hint(context, settings, t, FeTheme.dp(context, 18))   // "[A]" / "[B]": the chosen style's icons (FeTheme.faceIcon)
@@ -177,13 +177,15 @@ class DriversPanel(context: Context, private val settings: Settings, private val
                     LayoutParams(0, LayoutParams.WRAP_CONTENT, 1f))
                 if (inUse) addView(TextView(context).apply { text = "in use"; textSize = 13f; typeface = FeTheme.SERIF; setTextColor(FeTheme.GOLD) })
             }, LayoutParams(0, dp(52), 1f))
-            val use = FeTheme.iconButton(context, R.drawable.fe_ic_check, if (inUse) FeTheme.GOLD else FeTheme.LIGHT).apply {
+            // with the game's art: its tick in a green circle (IconStateSmall_Check), dimmed on the drivers not in use, and its red cross (IconState_Disable)
+            val use = FeTheme.iconButton(context, R.drawable.fe_ic_check, if (inUse) FeTheme.GOLD else FeTheme.LIGHT, "fe2_check").apply {
+                if (FeTheme.game(context) && !inUse) imageAlpha = 110
                 contentDescription = "Use ${d?.name ?: "the system driver"}"
                 setOnClickListener { settings[Settings.GPU_DRIVER] = id; refresh("use:$id") }
             }
             row.addView(use, LayoutParams(dp(46), dp(46)).apply { marginStart = dp(8) })
             if (d != null) {
-                val del = FeTheme.iconButton(context, R.drawable.fe_ic_trash).apply { contentDescription = "Delete ${d.name}"; setOnClickListener { onDelete(d) } }
+                val del = FeTheme.iconButton(context, R.drawable.fe_ic_trash, picture = "fe2_cross").apply { contentDescription = "Delete ${d.name}"; setOnClickListener { onDelete(d) } }
                 row.addView(del, LayoutParams(dp(46), dp(46)).apply { marginStart = dp(6) })
                 if (keep == "del:$id") refocus = del
             } else row.addView(View(context), LayoutParams(dp(46), dp(46)).apply { marginStart = dp(6) })

@@ -326,6 +326,53 @@ static uint32_t zero_locals(uint32_t **pw, size_t *pnw) {
 static _Atomic uint64_t g_words_bytes;   // SPIR-V kept for variants (the memory line)
 uint64_t vkd_words_bytes(void) { return atomic_load(&g_words_bytes); }
 static int shd_load_do(shd *s);
+// Vertex outputs start at zero. A translated vertex shader writes only what its Maxwell / Ampere code wrote: some components of a location never (Fire Emblem
+// Fortune's Weave's dust particles: 3d43d86f8e7702f5 writes location 6's x, y and z, and 300c5dd0fd84cf79 reads its w too), and little or nothing on a path that
+// returns early. What such an output holds is the driver's. Qualcomm's gives 0 (the work folder's re/texprobe/vsrun.c: its capture of that shader on generated
+// inputs is all zero); Turnip gives leftovers (a third of the bytes never written, the rest other values' remains), and the dust came out as solid flat quads.
+// Every Output variable with a location is stored zero (OpConstantNull) at the start of the entry function, and so is the position, through an access chain into
+// its block, so both drivers see the same (vsrun on both: identical captures). Stores, not OpVariable initializers; and not a store of the whole block, which
+// crashed both drivers' compilers. DM_VK_ZERO_OUT=0: as translated. Returns the new words (w is freed) or w
+static uint32_t *spv_zero_outputs(uint32_t *w, size_t *pnw, int *count) {
+    size_t nw = *pnw; uint32_t bound = w[3], entry = 0, iconst[8] = {0}; *count = 0;
+    uint32_t *pointee = calloc(bound, 4), *optr = calloc(bound, 4), *nullc = calloc(bound, 4), *struct_at = calloc(bound, 4), *posm = calloc(bound, 4);
+    uint8_t *want = calloc(bound, 1), *is_int = calloc(bound, 1); size_t nvar = 0;
+    for (size_t i = 5; i < nw; ) { uint32_t op = w[i] & 0xffff, len = w[i] >> 16; if (!len) break;
+        if (op == 15 && !entry) entry = w[i + 2];
+        if (op == SPV_TYPE_POINTER && len == 4 && w[i + 1] < bound && w[i + 3] < bound && w[i + 2] == 3) { pointee[w[i + 1]] = w[i + 3]; optr[w[i + 3]] = w[i + 1]; }
+        if (op == SPV_TYPE_STRUCT && w[i + 1] < bound) struct_at[w[i + 1]] = (uint32_t)i;
+        if (op == SPV_TYPE_INT && w[i + 1] < bound && w[i + 2] == 32) is_int[w[i + 1]] = 1;
+        if (op == SPV_CONSTANT && len == 4 && w[i + 1] < bound && is_int[w[i + 1]] && w[i + 3] < 8 && !iconst[w[i + 3]]) iconst[w[i + 3]] = w[i + 2];
+        if (op == SPV_DECORATE && len >= 4 && w[i + 2] == DEC_LOCATION && w[i + 1] < bound) want[w[i + 1]] = 1;
+        if (op == 72 && len == 5 && w[i + 3] == DEC_BUILTIN && w[i + 4] == 0 && w[i + 1] < bound) posm[w[i + 1]] = w[i + 2] + 1;   // OpMemberDecorate ... BuiltIn Position: the member, plus 1
+        if (op == 46 && len == 3 && w[i + 1] < bound) nullc[w[i + 1]] = w[i + 2];   // an OpConstantNull the module already has, by type
+        if (op == SPV_VARIABLE && w[i + 3] == 3) nvar++;
+        i += len; }
+    uint32_t *o = malloc((nw + nvar * 12) * 4), *todo = malloc((nvar + 1) * 16); size_t no = 0, nt = 0; int state = 0;   // todo: variable, null constant, pointer type and index constant of a member (0: the variable itself)
+    for (size_t i = 0; i < nw; ) { uint32_t op = i < 5 ? 0 : w[i] & 0xffff, len = i < 5 ? 1 : w[i] >> 16; if (!len) { memcpy(o + no, w + i, (nw - i) * 4); no += nw - i; break; }
+        if (op == SPV_VARIABLE && w[i + 3] == 3 && w[i + 2] < bound && w[i + 1] < bound && pointee[w[i + 1]]) {
+            uint32_t t = pointee[w[i + 1]], mt = 0, m = 0;
+            if (!want[w[i + 2]]) {   // not a located output: the block with the position, if its member's pointer type and index constant are in the module
+                t = 0;
+                if (struct_at[pointee[w[i + 1]]] && posm[pointee[w[i + 1]]]) { m = posm[pointee[w[i + 1]]] - 1; size_t sa = struct_at[pointee[w[i + 1]]];
+                    if (m + 2 < (w[sa] >> 16) && m < 8 && iconst[m]) { mt = w[sa + 2 + m]; if (mt < bound && optr[mt]) t = mt; } }
+            }
+            if (t) {
+                if (!nullc[t]) { nullc[t] = bound++; o[no++] = 3u << 16 | 46; o[no++] = t; o[no++] = nullc[t]; }   // before the variable: its type is declared by now
+                todo[nt * 4] = w[i + 2]; todo[nt * 4 + 1] = nullc[t]; todo[nt * 4 + 2] = mt ? optr[mt] : 0; todo[nt * 4 + 3] = mt ? iconst[m] : 0; nt++; }
+        }
+        if (state == 2 && op != SPV_VARIABLE) {   // after the entry function's own variables
+            for (size_t k = 0; k < nt; k++) { uint32_t dst = todo[k * 4];
+                if (todo[k * 4 + 2]) { dst = bound++; o[no++] = 5u << 16 | 65; o[no++] = todo[k * 4 + 2]; o[no++] = dst; o[no++] = todo[k * 4]; o[no++] = todo[k * 4 + 3]; }   // OpAccessChain to the position
+                o[no++] = 3u << 16 | 62; o[no++] = dst; o[no++] = todo[k * 4 + 1]; }
+            state = 3; *count = (int)nt; }
+        memcpy(o + no, w + i, len * 4); no += len;
+        if (op == 54 && w[i + 2] == entry) state = 1; else if (state == 1 && op == 248) state = 2;
+        i += len; }
+    free(pointee); free(optr); free(nullc); free(struct_at); free(posm); free(want); free(is_int); free(todo);
+    if (!*count) { free(o); return w; }
+    o[3] = bound; free(w); *pnw = no; return o;
+}
 static int shd_load(shd *s) {   // a shader's first use reads its SPIR-V from storage and makes its module: timed for the slow-frame log (vkx_sb_note 4)
     if (s->loaded) return !s->bad;
     uint64_t t0 = vkx_now_ns(); int ok = shd_load_do(s); vkx_sb_note(4, vkx_now_ns() - t0); return ok;
@@ -452,6 +499,10 @@ static int shd_load_do(shd *s) {
         static int dump = -1; if (dump < 0) dump = getenv("DM_VK_DUMP_SPV") != NULL;
         if (dump) { char d[600], q[700]; snprintf(d, sizeof d, "%s/spv_patched", getenv("DM_ROOT") ? getenv("DM_ROOT") : "."); mkdir(d, 0755);
             snprintf(q, sizeof q, "%s/%016llx.spv", d, (unsigned long long)s->key); FILE *o = fopen(q, "wb"); if (o) { fwrite(w, 4, nw, o); fclose(o); } }
+    }
+    if (ok && stage == 0) {
+        static int zo = -1; if (zo < 0) { const char *e = getenv("DM_VK_ZERO_OUT"); zo = !(e && e[0] == '0'); VLOG("vertex outputs %s", zo ? "are stored zero first (what a shader does not write is 0 on any driver)" : "as translated (DM_VK_ZERO_OUT=0)"); }
+        if (zo) { int nz = 0; w = spv_zero_outputs(w, &nw, &nz); }
     }
     if (ok) {
         VkShaderModuleCreateInfo mi = {VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, NULL, 0, nw * 4, w};
@@ -715,13 +766,17 @@ static VkSampler sampler_of_(const samp_par *sp) {
         int mip = sp->minf >= NVN_MIN_FILTER_NEAREST_MIPMAP_NEAREST;
         VkSamplerCustomBorderColorCreateInfoEXT cb = {VK_STRUCTURE_TYPE_SAMPLER_CUSTOM_BORDER_COLOR_CREATE_INFO_EXT, NULL, {.float32 = {sp->border[0], sp->border[1], sp->border[2], sp->border[3]}}, VK_FORMAT_UNDEFINED};
         int border = sp->ws == NVN_WRAP_MODE_CLAMP_TO_BORDER || sp->wt == NVN_WRAP_MODE_CLAMP_TO_BORDER || sp->wr == NVN_WRAP_MODE_CLAMP_TO_BORDER;
-        VkSamplerCreateInfo si = {VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO, border && g_vk.border ? &cb : NULL, 0,
+        // The three border colours Vulkan names are given by name, a custom colour only for any other: a custom colour without a format
+        // (customBorderColorWithoutFormat) is the driver's to pack for whatever texture is sampled, and the named ones do not depend on that
+        const float *bc = sp->border; int std_bc = (bc[0] == 0 && bc[1] == 0 && bc[2] == 0 && (bc[3] == 0 || bc[3] == 1)) || (bc[0] == 1 && bc[1] == 1 && bc[2] == 1 && bc[3] == 1);
+        { static int once; if (border && !once) { once = 1; VLOG("samplers: border colours %s", std_bc ? "by name where they are transparent black, opaque black or opaque white" : "custom (first seen is not a named one)"); } }
+        VkSamplerCreateInfo si = {VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO, border && g_vk.border && !std_bc ? &cb : NULL, 0,
             sp->magf == NVN_MAG_FILTER_LINEAR ? VK_FILTER_LINEAR : VK_FILTER_NEAREST, (sp->minf & 1) ? VK_FILTER_LINEAR : VK_FILTER_NEAREST,
             sp->minf >= NVN_MIN_FILTER_NEAREST_MIPMAP_LINEAR ? VK_SAMPLER_MIPMAP_MODE_LINEAR : VK_SAMPLER_MIPMAP_MODE_NEAREST,
             wrap_vk(sp->ws), wrap_vk(sp->wt), wrap_vk(sp->wr), sp->lod_bias, sp->aniso > 1, sp->aniso > 1 ? (sp->aniso < g_vk.lim.maxSamplerAnisotropy ? sp->aniso : g_vk.lim.maxSamplerAnisotropy) : 1,
             sp->cmp_mode == NVN_COMPARE_MODE_COMPARE_R_TO_TEXTURE, sp->cmp_func >= 1 && sp->cmp_func <= 8 ? (VkCompareOp)(sp->cmp_func - 1) : VK_COMPARE_OP_ALWAYS,
             sp->lod_min, mip ? sp->lod_max : 0.25f,
-            border && g_vk.border ? VK_BORDER_COLOR_FLOAT_CUSTOM_EXT : (sp->border[3] > 0.5f ? (sp->border[0] > 0.5f ? VK_BORDER_COLOR_FLOAT_OPAQUE_WHITE : VK_BORDER_COLOR_FLOAT_OPAQUE_BLACK) : VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK), VK_FALSE};
+            border && g_vk.border && !std_bc ? VK_BORDER_COLOR_FLOAT_CUSTOM_EXT : (sp->border[3] > 0.5f ? (sp->border[0] > 0.5f ? VK_BORDER_COLOR_FLOAT_OPAQUE_WHITE : VK_BORDER_COLOR_FLOAT_OPAQUE_BLACK) : VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK), VK_FALSE};
         if (si.maxLod < si.minLod) si.maxLod = si.minLod;
         if (g_nsamp_used >= NSAMP * 3 / 4) { VRED_ONCE("more than %d distinct samplers", NSAMP * 3 / 4); return g_samp[0].s; }
         if (vkCreateSampler(g_vk.dev, &si, NULL, &e->s)) { e->s = VK_NULL_HANDLE; VRED_ONCE("vkCreateSampler failed"); return VK_NULL_HANDLE; }
@@ -905,7 +960,7 @@ static _Atomic uint64_t g_bg_n, g_bg_ns, g_n_pipe_wait_skip, g_n_pipe_waited, g_
 void vkd_pcache_tick(uint64_t frame) {
     if (frame % 300 == 0 && g_bg_n) {   // what the pipeline workers did in the last 300 frames
         uint64_t n = atomic_exchange(&g_bg_n, 0), ns = atomic_exchange(&g_bg_ns, 0), w = atomic_exchange(&g_n_pipe_waited, 0), sk = atomic_exchange(&g_n_pipe_wait_skip, 0), mu = atomic_exchange(&g_n_pipe_must, 0);
-        VLOG("pipelines: %llu built over the last 300 frames, %.1f ms each; draws that waited for one %llu (%llu of them in passes with no depth image, which are never skipped), skipped until it was ready %llu", (unsigned long long)n, n ? ns / 1e6 / (double)n : 0.0, (unsigned long long)w, (unsigned long long)mu, (unsigned long long)sk);
+        VLOG("pipelines: %llu built over the last 300 frames, %.1f ms each; draws that waited for one %llu (%llu of them opaque, whole-screen or in passes with no depth image, which are never skipped), skipped until it was ready %llu", (unsigned long long)n, n ? ns / 1e6 / (double)n : 0.0, (unsigned long long)w, (unsigned long long)mu, (unsigned long long)sk);
     }
     uint64_t made = g_n_pipelines + g_n_cpipes_all();
     if (!g_pcache || frame % 300 || made == g_pcache_saved_n || atomic_load(&g_pcache_writing)) return;
@@ -975,7 +1030,7 @@ static VkShaderModule vs_variant(shd *vs, uint32_t add) {
     }
     if (!ep_at || !dec_at || !var_at || !ptr) { VRED_ONCE("vertex shader %016llx: no place to add the outputs a pixel shader reads", (unsigned long long)vs->key); return vs->mod; }
     int n = __builtin_popcount(add);
-    uint32_t *o = malloc((nw + (size_t)n * 9) * 4); size_t no = 0; uint32_t bound = w[3], ids[32]; int k = 0;
+    uint32_t *o = malloc((nw + (size_t)n * 10) * 4); size_t no = 0; uint32_t bound = w[3], ids[32]; int k = 0;
     for (int l = 0; l < 32; l++) if (add >> l & 1) ids[k++] = bound++;
     for (size_t i = 0; i < nw; ) {
         uint32_t len = i < 5 ? 1 : w[i] >> 16;
@@ -985,6 +1040,7 @@ static VkShaderModule vs_variant(shd *vs, uint32_t add) {
         memcpy(o + no, w + i, len * 4); no += len; i += len;
     }
     o[3] = bound;
+    { const char *e = getenv("DM_VK_ZERO_OUT"); if (!(e && e[0] == '0')) { int nz = 0; o = spv_zero_outputs(o, &no, &nz); } }   // the added outputs are stored zero too
     VkShaderModuleCreateInfo mi = {VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, NULL, 0, no * 4, o};
     VkShaderModule m; VkResult r = vkCreateShaderModule(g_vk.dev, &mi, NULL, &m); free(o);
     if (r) return vs->mod;
@@ -1239,12 +1295,13 @@ static int pipe_workers_start(void) {
     return ok;
 }
 // a pipeline still being built: wait while this frame's budget lasts. Returns the entry once ready (NULL if its build failed), or NULL to skip the draw this frame
+static int g_pipe_must;   // the draw being looked up is a whole-screen one (three or four vertices, no index buffer): set by the draw, read by pipe_wait
 static pent *pipe_wait(pent *e) {
     static uint64_t frame = ~0ull, used;
     uint64_t f = vkx_frame(); if (f != frame) { frame = f; used = 0; }
     if (atomic_load(&e->building)) {
         uint64_t b = pipe_wait_budget_ns(), left = used < b ? b - used : 0;
-        if (!e->k.d_on && !e->k.s_on) {   // a pass with no depth image: a full-screen step (lighting, combining, tone mapping) or the interface. Skipped, the whole picture is
+        if ((!e->k.d_on && !e->k.s_on) || g_pipe_must) {   // a pass with no depth image: a full-screen step (lighting, combining, tone mapping) or the interface. Skipped, the whole picture is
                                            // black or stale for the frame (log_blackzoom.txt: up to 954 draws skipped in 300 frames with a cold cache, a black flash on first zoom), so it waits
             uint64_t t0 = vkx_now_ns();
             pthread_mutex_lock(&g_pq_mu); while (atomic_load(&e->building)) pthread_cond_wait(&g_pdone_cv, &g_pq_mu); pthread_mutex_unlock(&g_pq_mu);
@@ -1286,7 +1343,8 @@ static pent *pipeline_of(const pkey *k) {
     }
     st[ns++] = (VkPipelineShaderStageCreateInfo){VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, NULL, 0, VK_SHADER_STAGE_VERTEX_BIT, vmod, "main", NULL};
     if (k->gs) st[ns++] = (VkPipelineShaderStageCreateInfo){VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, NULL, 0, VK_SHADER_STAGE_GEOMETRY_BIT, int_mod(k->gs, k->imu[2], k->ims[2]), "main", NULL};
-    if (k->ps) st[ns++] = (VkPipelineShaderStageCreateInfo){VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, NULL, 0, VK_SHADER_STAGE_FRAGMENT_BIT, pmod, "main", NULL};
+    static const VkPipelineShaderStageRequiredSubgroupSizeCreateInfo k_rsg64 = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO, NULL, 64};   // nvn_vk_mem.c "Subgroup size": pixel shaders too
+    if (k->ps) st[ns++] = (VkPipelineShaderStageCreateInfo){VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, g_vk.sg_pin_fs ? &k_rsg64 : NULL, 0, VK_SHADER_STAGE_FRAGMENT_BIT, pmod, "main", NULL};
     j->vi = (VkPipelineVertexInputStateCreateInfo){VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
     j->ia = (VkPipelineInputAssemblyStateCreateInfo){VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO, NULL, 0, (VkPrimitiveTopology)k->topo, VK_FALSE};
     j->dcc = (VkPipelineViewportDepthClipControlCreateInfoEXT){VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_DEPTH_CLIP_CONTROL_CREATE_INFO_EXT, NULL, VK_TRUE};
@@ -1483,7 +1541,12 @@ static int stage_set(sub_t *s, shd *sh, VkDescriptorSet *out, int *missing_tex) 
                     if (stage == 5 && b->kind == BK_SBUF && ncsw_new < 32) { csw_new[0][ncsw_new] = u->addr; csw_new[1][ncsw_new] = u->size; ncsw_new++; }
                     uint64_t addr = u->addr, size = u->size;
                     if (b->kind == BK_SBUF) { uint64_t al = addr & ~15ull; size += addr - al; addr = al; }   // the shader indexes from the 16-byte aligned base (Ryujinx GlobalToStorage, host alignment 16)
-                    uint64_t al_req = b->kind == BK_SBUF ? g_vk.lim.minStorageBufferOffsetAlignment : g_vk.lim.minUniformBufferOffsetAlignment;
+                    // A storage buffer is bound from the boundary its shader was translated for, 64 bytes (vk_spirv.py SB_ALIGN, Program.cs sb_align: the shader reads at
+                    // address - (address & -64)), not from the device's own minimum. Qualcomm's driver asks for 64, so the two agreed; Turnip asks for 4, and every
+                    // storage buffer off a 64-byte boundary was bound 16, 32 or 48 bytes too far in and read shifted (its log: "alignment uniform 64 storage 4").
+                    // A device asking for more than 64 keeps its own value (and the line below reports the shift)
+                    uint64_t sb_al = g_vk.lim.minStorageBufferOffsetAlignment > 64 ? g_vk.lim.minStorageBufferOffsetAlignment : 64;
+                    uint64_t al_req = b->kind == BK_SBUF ? sb_al : g_vk.lim.minUniformBufferOffsetAlignment;
                     uint64_t avail = 0; int part = 0;
                     if (!vk_pool_find(addr, size, &pb, &po) && vk_pool_find_part(addr, size, &pb, &po, &avail) && avail >= 16) {
                         // the range runs past its pool's end: bound to the end instead of the zero buffer (the shader reads the part it uses)
@@ -1509,7 +1572,7 @@ static int stage_set(sub_t *s, shd *sh, VkDescriptorSet *out, int *missing_tex) 
                                                      (unsigned long long)addr, (unsigned long long)u->size, (unsigned long long)(po % al_req), (unsigned long long)al_req, (unsigned long long)sh->key, stage, b->slot, (unsigned long long)g_presents);
                         vkx_ring_note("UBO-COPY shader %016llx st%d slot %d addr %#llx +%llu size %#llx", (unsigned long long)sh->key, stage, b->slot, (unsigned long long)addr, (unsigned long long)(po % al_req), (unsigned long long)u->size);
                     } else if (part || vk_pool_find(addr, size, &pb, &po)) {
-                        if (po % al_req) VRED_ONCE("%s buffer at %#llx is not %llu-byte aligned in its pool: bound at the lower boundary (reads shifted)", b->kind == BK_SBUF ? "a storage" : "a uniform", (unsigned long long)addr, (unsigned long long)al_req);
+                        if (po % al_req && !(b->kind == BK_SBUF && al_req == 64)) VRED_ONCE("%s buffer at %#llx is not %llu-byte aligned in its pool: bound at the lower boundary (reads shifted)", b->kind == BK_SBUF ? "a storage" : "a uniform", (unsigned long long)addr, (unsigned long long)al_req);
                         uint64_t aligned = po - po % al_req; size += po - aligned;
                         if (b->kind == BK_SBUF && sbuf_open_on()) {
                             // A storage buffer is bound past its size, up to 1 MB or its pool's end (DM_VK_SBUF_EXACT=1: its size only, as before). On the console a shader
@@ -1590,6 +1653,8 @@ static int stage_set(sub_t *s, shd *sh, VkDescriptorSet *out, int *missing_tex) 
                 TRACE("  st%d b%u %s dim %d arr %d kind %d cbs %d handle %#x [%u]: tid %d sid %d reg %d ser %llu %ux%u fmt %#x tgt %d mem %p -> view %s", stage, b->vb, storage ? "storage image" : "texture", b->dim, b->arrayed, b->kind, b->cbs, (unsigned)b->handle, k, tid, sid,
                       tid ? treg_get(tid, &r) : 0, tid && treg_get(tid, &r) ? (unsigned long long)r.t.serial : 0ull, tid && treg_get(tid, &r) ? r.t.d.width : 0, tid && treg_get(tid, &r) ? r.t.d.height : 0,
                       tid && treg_get(tid, &r) ? r.t.d.format : 0, tid && treg_get(tid, &r) ? r.t.d.target : -1, tid && treg_get(tid, &r) ? (void *)r.t.mem : NULL, d->imageView ? (zeroed ? "zero" : "ok") : "none");
+                if (have_sp) TRACE("    sampler %d: filter min %d mag %d, wrap %d %d %d, compare %d/%d, lod %.2f to %.2f bias %.2f, aniso %.1f, border %.3f %.3f %.3f %.3f", sid, sp.minf, sp.magf, sp.ws, sp.wt, sp.wr,
+                                   sp.cmp_mode, sp.cmp_func, (double)sp.lod_min, (double)sp.lod_max, (double)sp.lod_bias, (double)sp.aniso, (double)sp.border[0], (double)sp.border[1], (double)sp.border[2], (double)sp.border[3]);
             }
             if (!g_vk.null_desc) for (uint32_t k = 0; k < n; k++) if (!ii[nii - n + k].imageView) { VRED_ONCE("a texture binding has no texture and the driver has no null descriptors: draw skipped"); return 0; }
         } else if (b->kind == BK_POOL_TEX || b->kind == BK_POOL_SAMP) { pools = 1; continue; }   // written below, element by element
@@ -1750,7 +1815,16 @@ void vkd_draw(sub_t *s, uint32_t op, const void *rec, uint32_t size) {
             }
         }
     }
-    pent *pe = pipeline_of(&k); if (!pe) { g_n_skip_other++; return; }
+    // A whole-screen draw is never skipped for a pipeline still being built, in a pass with a depth image either: Fire Emblem Fortune's Weave draws some of its
+    // full-screen steps with the depth image attached (fd88ba60fe74bd15 into the scene with depth test on), and a battle zoom on a cold cache was one black
+    // frame (Turnip's own, smaller pipeline cache: up to 542 draws skipped in 300 frames, logs_mem3/log_black2_prev.txt)
+    // Nor is an opaque draw (one that writes depth, or has blending off): the game draws its scenery in a depth pass and then a colour pass that takes only pixels of
+    // equal depth, and a mesh skipped in one of the two came out black (the arena's whole floor for a moment, on a cold cache: logs_mem3/log_cold1.txt, 830 draws
+    // skipped in 900 frames). What may still be skipped is blended and writes no depth: particles and other effects, which only appear a frame late.
+    // DM_VK_PIPE_SKIP_OPAQUE=1: opaque draws skipped too, as before
+    { static int so = -1; if (so < 0) { const char *e = getenv("DM_VK_PIPE_SKIP_OPAQUE"); so = e && e[0] == '1'; }
+      g_pipe_must = (dr && dr->count <= 4) || (!so && (S.ds.dw || !S.color.blend_en)); }
+    pent *pe = pipeline_of(&k); g_pipe_must = 0; if (!pe) { g_n_skip_other++; return; }
     VkCommandBuffer cb = s->cb;
     vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pe->p);
     for (uint32_t i = 0; i < 3; i++) if (sets[i]) vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pe->pl, i, 1, &sets[i], 0, NULL);

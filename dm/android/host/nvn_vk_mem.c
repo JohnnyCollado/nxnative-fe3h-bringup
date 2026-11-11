@@ -111,6 +111,13 @@ static void vk_init_once(void) {
         g_vk.sg_size = q11.subgroupSize; g_vk.sg_min = q13.minSubgroupSize ? q13.minSubgroupSize : q11.subgroupSize; g_vk.sg_max = q13.maxSubgroupSize ? q13.maxSubgroupSize : q11.subgroupSize;
         f13.subgroupSizeControl = h13.subgroupSizeControl; f13.computeFullSubgroups = h13.computeFullSubgroups; g_vk.sg_full = h13.computeFullSubgroups;   // sg_full: nvn_vk_sgprobe.c
         g_vk.sg_pin_cs = h13.subgroupSizeControl && (q13.requiredSubgroupSizeStages & VK_SHADER_STAGE_COMPUTE_BIT) && g_vk.sg_min <= 64 && g_vk.sg_max >= 64 && (g_vk.sg_min != g_vk.sg_max || g_vk.sg_size != 64);
+        // The same for pixel shaders: 488 of this game's 7,988 read a neighbouring pixel's value by lane number (OpGroupNonUniformShuffle on SubgroupLocalInvocationId, the
+        // translation of the GPU's in-quad shuffle), also written for 64 lanes. Turnip runs compute and fragment shaders at 64 or 128 as it chooses (Mesa tu_device.cc:
+        // "Only compute and fragment shaders can run with a doubled wave size") and lets both be pinned; unpinned, those pixel shaders are the suspected cause of its
+        // magenta blocks (the lit pass's 5743b0078253f3ed is one of the 488). DM_VK_SG_PIN_FS=0 leaves them as the driver runs them
+        { const char *e = getenv("DM_VK_SG_PIN_FS");
+          g_vk.sg_pin_fs = !(e && e[0] == '0') && h13.subgroupSizeControl && (q13.requiredSubgroupSizeStages & VK_SHADER_STAGE_FRAGMENT_BIT) && g_vk.sg_min <= 64 && g_vk.sg_max >= 64 && (g_vk.sg_min != g_vk.sg_max || g_vk.sg_size != 64);
+          VLOG("subgroups: pixel shaders %s", g_vk.sg_pin_fs ? "pinned to 64 lanes" : "as the device runs them"); }
         VLOG("subgroups: %u lanes (%u-%u), operations %#x in stages %#x; compute pipelines %s", q11.subgroupSize, g_vk.sg_min, g_vk.sg_max, q11.subgroupSupportedOperations, q11.subgroupSupportedStages,
              g_vk.sg_pin_cs ? "pinned to 64" : g_vk.sg_size == 64 || g_vk.sg_size == 32 ? "as the device runs them (right for shaders translated for 64)" : "[RED] not 64 and not pinnable: warp shaders read the wrong lanes");
     }
@@ -142,6 +149,16 @@ static void vk_init_once(void) {
          dp.conformanceVersion.subminor, vk_driver_desc());
     VLOG("device: %s, Vulkan %u.%u.%u, %u device extensions on; pool memory type %u (flags %#x)", p.deviceName, VK_API_VERSION_MAJOR(p.apiVersion), VK_API_VERSION_MINOR(p.apiVersion),
          VK_API_VERSION_PATCH(p.apiVersion), non, g_vk.pool_type, g_vk.pool_type == ~0u ? 0 : g_vk.mp.memoryTypes[g_vk.pool_type].propertyFlags);
+    {   // What this driver can sample of the formats the games' textures come in, and filter linearly: a texture in a format the driver cannot sample is still made (tex_create
+        // asks for no usage the format lacks) and reads undefined. One line, to compare two drivers on one device (Qualcomm's and Turnip on the Adreno 830)
+        static const struct { VkFormat f; const char *n; } k[] = {{VK_FORMAT_BC1_RGBA_SRGB_BLOCK, "BC1"}, {VK_FORMAT_BC2_SRGB_BLOCK, "BC2"}, {VK_FORMAT_BC3_SRGB_BLOCK, "BC3"}, {VK_FORMAT_BC4_UNORM_BLOCK, "BC4"},
+            {VK_FORMAT_BC5_UNORM_BLOCK, "BC5"}, {VK_FORMAT_BC6H_UFLOAT_BLOCK, "BC6H"}, {VK_FORMAT_BC7_SRGB_BLOCK, "BC7"}, {VK_FORMAT_ASTC_4x4_SRGB_BLOCK, "ASTC4x4"}, {VK_FORMAT_ASTC_8x8_SRGB_BLOCK, "ASTC8x8"},
+            {VK_FORMAT_D32_SFLOAT, "D32F"}, {VK_FORMAT_R16G16B16A16_SFLOAT, "RGBA16F"}, {VK_FORMAT_B10G11R11_UFLOAT_PACK32, "R11G11B10F"}, {VK_FORMAT_R32_SFLOAT, "R32F"}};
+        char line[512]; size_t n = 0; line[0] = 0;
+        for (size_t i = 0; i < sizeof k / sizeof *k; i++) { VkFormatProperties fp; vkGetPhysicalDeviceFormatProperties(g_vk.pd, k[i].f, &fp); VkFormatFeatureFlags ff = fp.optimalTilingFeatures;
+            n += (size_t)snprintf(line + n, sizeof line - n, " %s %s", k[i].n, !(ff & VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT) ? "NOT SAMPLED" : (ff & VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT) ? "linear" : "nearest only"); if (n >= sizeof line - 40) break; }
+        VLOG("texture formats:%s", line);
+    }
     void vkx_sg_probe(void); vkx_sg_probe();   // how the driver groups compute threads into subgroups, against what the warp shaders assume (nvn_vk_sgprobe.c)
 }
 int vk_ready(void) { pthread_once(&g_vk_once, vk_init_once); return g_vk.ok; }

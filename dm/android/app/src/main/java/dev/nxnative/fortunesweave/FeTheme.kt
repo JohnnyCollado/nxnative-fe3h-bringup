@@ -190,7 +190,16 @@ object FeTheme {
     }
 
     /** A small diamond icon button (the drivers' use and delete): the game's diamond frame, a gold ring when focused or pressed. [glyph] is a res/drawable vector. */
-    fun iconButton(c: Context, glyph: Int, tint: Int = LIGHT): android.widget.ImageView = android.widget.ImageView(c).apply {
+    /** With [picture] (a name in art_res, the game's own icon) and the game's art in the build, that picture is shown as it is, on no frame; a gold ring marks focus. */
+    fun iconButton(c: Context, glyph: Int, tint: Int = LIGHT, picture: String? = null): android.widget.ImageView = android.widget.ImageView(c).apply {
+        val pic = if (picture != null && game(c)) art(c, picture) else null
+        if (pic != null) {
+            fun gold(): Drawable = GradientDrawable().apply { shape = GradientDrawable.OVAL; setColor(Color.argb(0x55, 0xe8, 0xd9, 0xa8)); setStroke(dp(c, 2), GOLD) }
+            background = StateListDrawable().apply { addState(intArrayOf(android.R.attr.state_pressed), gold()); addState(intArrayOf(android.R.attr.state_focused), gold()); addState(intArrayOf(), android.graphics.drawable.ColorDrawable(Color.TRANSPARENT)) }
+            setImageDrawable(pic); val p = dp(c, 6); setPadding(p, p, p, p); scaleType = android.widget.ImageView.ScaleType.FIT_CENTER
+            isFocusable = true; isClickable = true
+            return@apply
+        }
         fun base(): Drawable = art(c, "fe_dia_small") ?: GradientDrawable().apply { shape = GradientDrawable.OVAL; setColor(Color.rgb(0x2b, 0x24, 0x40)); setStroke(dp(c, 2), Color.rgb(0xb9, 0xab, 0x86)) }
         fun ring(): Drawable = LayerDrawable(arrayOf(GradientDrawable().apply { shape = GradientDrawable.OVAL; setColor(Color.argb(0x55, 0xe9, 0xcf, 0x7c)); setStroke(dp(c, 2), GOLD) }, base()))
         background = StateListDrawable().apply {
@@ -253,11 +262,19 @@ object FeTheme {
     }
     /** The icon of the button that sends the game's [f] now (hint lines). */
     fun iconOf(c: Context, s: Settings, f: Face): Drawable? { val i = faces(s).indexOf(f); return if (i < 0) null else faceIcon(c, s, i) }
-    /** [t] with "[A]" / "[B]" replaced by the icon of the button that sends that face now, sized to the text. */
+    /** The chosen style's d-pad icon (ctl_<ns|xb|ps>_dpad_all.png, the same packs). */
+    fun dpadIcon(c: Context, s: Settings): Drawable? = art(c, "ctl_" + (when (s[Settings.BUTTON_STYLE]) { "xbox" -> "xb"; "playstation" -> "ps"; else -> "ns" }) + "_dpad_all")
+    /** [t] with "[A]" / "[B]" replaced by the icon of the button that sends that face now and "[D]" by the d-pad's, sized to the text. */
     fun hint(c: Context, s: Settings, t: String, px: Int): CharSequence {
         val out = android.text.SpannableStringBuilder()
         var i = 0
         while (i < t.length) {
+            if (t.startsWith("[D]", i)) {
+                val dd = dpadIcon(c, s)
+                if (dd != null) { dd.setBounds(0, 0, px, px); val at = out.length; out.append(" "); out.setSpan(android.text.style.ImageSpan(dd, android.text.style.DynamicDrawableSpan.ALIGN_CENTER), at, at + 1, android.text.Spanned.SPAN_EXCLUSIVE_EXCLUSIVE) }
+                else out.append("D-pad")
+                i += 3; continue
+            }
             val f = if (t.startsWith("[A]", i)) Face.A else if (t.startsWith("[B]", i)) Face.B else null
             val d = f?.let { iconOf(c, s, it) }
             if (f != null && d != null) {
