@@ -21,6 +21,7 @@ typedef struct {
     float jitter[2], mv[2], pre_exposure;
     uint32_t flags, reset;                                   // the game's DLSS flags and its history reset
     VkCommandBuffer cb;                                      // the submission's buffer: FSR 2 records into it
+    VkImage reactive; VkImageView reactive_v;                // FSR 2's reactive mask (R8, render size; nvn_vk_draw.c reactive_run), or VK_NULL_HANDLE
 } fsr2_job;
 
 int fsr2_dispatch(const fsr2_job *j);   // 1 when FSR 2 ran (recorded into j->cb); 0 when it cannot (the caller stretches bilinearly)

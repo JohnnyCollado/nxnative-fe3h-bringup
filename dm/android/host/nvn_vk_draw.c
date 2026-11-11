@@ -325,8 +325,12 @@ static uint32_t zero_locals(uint32_t **pw, size_t *pnw) {
 }
 static _Atomic uint64_t g_words_bytes;   // SPIR-V kept for variants (the memory line)
 uint64_t vkd_words_bytes(void) { return atomic_load(&g_words_bytes); }
-static int shd_load(shd *s) {
+static int shd_load_do(shd *s);
+static int shd_load(shd *s) {   // a shader's first use reads its SPIR-V from storage and makes its module: timed for the slow-frame log (vkx_sb_note 4)
     if (s->loaded) return !s->bad;
+    uint64_t t0 = vkx_now_ns(); int ok = shd_load_do(s); vkx_sb_note(4, vkx_now_ns() - t0); return ok;
+}
+static int shd_load_do(shd *s) {
     s->loaded = 1; s->bad = 1;
     char p[600]; snprintf(p, sizeof p, "%s/%016llx.spv", g_spirv_dir, (unsigned long long)s->key);
     FILE *f = fopen(p, "rb"); if (!f) { VLOG("[RED] shader %016llx: %s missing", (unsigned long long)s->key, p); return 0; }
@@ -858,7 +862,7 @@ typedef struct {
     uint32_t alpha;                                     // the pixel shader's alpha-test variant is used (alpha_func != ALWAYS and the shader has a float colour 0)
     uint64_t imu[3], ims[3];                            // vertex, pixel, geometry: bindings retyped for integer textures (int_mod; stage_set's masks)
 } pkey;
-typedef struct pent { struct pent *next; pkey k; VkPipeline p; VkPipelineLayout pl; } pent;
+typedef struct pent { struct pent *next; pkey k; VkPipeline p; VkPipelineLayout pl; _Atomic int building; } pent;   // building: a worker is still making p (pipe_wait)
 enum { NPIPE = 4096 };
 static pent *g_pipe[NPIPE];
 static VkPipelineCache g_pcache;
@@ -866,7 +870,7 @@ static VkPipelineCache g_pcache;
 // some 140 pipelines compiled. The driver checks the data's header (its own vendor, device and cache UUID) and ignores data that is not its own, so each driver keeps
 // a file of its own, named by its cache UUID ($DM_ROOT/vk_pipelines-<uuid>.bin): switching between the system driver and a custom one (vk_driver.c) no longer
 // throws the other's pipelines away. A first run on a driver without its file takes the old shared vk_pipelines.bin, which only the driver that wrote it accepts. Saved every 300 presents while new pipelines appear (the host has no clean exit)
-static uint64_t g_pcache_saved_n;
+static uint64_t g_pcache_saved_n; static size_t g_pcache_saved_size;
 static uint64_t g_n_cpipes_all(void);
 static void pcache_path(char *p, size_t n) {
     VkPhysicalDeviceProperties pr; vkGetPhysicalDeviceProperties(g_vk.pd, &pr);
@@ -883,17 +887,35 @@ static void pcache_open(void) {
     if (vkCreatePipelineCache(g_vk.dev, &ci, NULL, &g_pcache)) { ci.initialDataSize = 0; ci.pInitialData = NULL; vkCreatePipelineCache(g_vk.dev, &ci, NULL, &g_pcache); n = 0; }
     VLOG("pipeline cache: %zu bytes loaded from %s", n, p);
     free(data);
+    size_t now = 0; if (!vkGetPipelineCacheData(g_vk.dev, g_pcache, &now, NULL)) g_pcache_saved_size = now;   // what the driver holds once loaded: unchanged means nothing to save
 }
+// The save costs a frame when done in full: the cache's whole data (47 MB in Fire Emblem Fortune's Weave) copied out of the driver and written to storage, on the
+// thread that presents. "made" counts pipelines requested, cache hits included, so with a warm cache every 300th frame rewrote the same file (a 52 ms frame every
+// 10 s; logs_mem3/log_perf2.txt: 21 saves of 46,858,457 bytes). Now the driver is asked for the size alone first (no copy) and nothing is saved while it has not
+// changed; when it has, the data is copied here and written by a thread of its own
+static _Atomic int g_pcache_writing;
+typedef struct { void *d; size_t n; uint64_t made; } pcache_job;
+static void *pcache_write(void *arg) {
+    pcache_job *j = arg; char p[600], t[620]; pcache_path(p, sizeof p); snprintf(t, sizeof t, "%s.tmp", p);
+    FILE *f = fopen(t, "wb");
+    if (f) { int ok = fwrite(j->d, 1, j->n, f) == j->n; ok &= fclose(f) == 0; if (ok && !rename(t, p)) VLOG("pipeline cache: %zu bytes saved (%llu pipelines made this run)", j->n, (unsigned long long)j->made); else VLOG("[RED] pipeline cache: the save to %s failed", p); }
+    free(j->d); free(j); atomic_store(&g_pcache_writing, 0); return NULL;
+}
+static _Atomic uint64_t g_bg_n, g_bg_ns, g_n_pipe_wait_skip, g_n_pipe_waited, g_n_pipe_must;   // the pipeline workers' counts (below)
 void vkd_pcache_tick(uint64_t frame) {
-    uint64_t made = g_n_pipelines + g_n_cpipes_all();
-    if (!g_pcache || frame % 300 || made == g_pcache_saved_n) return;
-    size_t n = 0; if (vkGetPipelineCacheData(g_vk.dev, g_pcache, &n, NULL) || !n) return;
-    void *d = malloc(n); if (!d) return;
-    if (!vkGetPipelineCacheData(g_vk.dev, g_pcache, &n, d)) {
-        char p[600], t[620]; pcache_path(p, sizeof p); snprintf(t, sizeof t, "%s.tmp", p);
-        FILE *f = fopen(t, "wb"); if (f) { int ok = fwrite(d, 1, n, f) == n; ok &= fclose(f) == 0; if (ok && !rename(t, p)) { g_pcache_saved_n = made; VLOG("pipeline cache: %zu bytes saved (%llu pipelines made this run)", n, (unsigned long long)made); } }
+    if (frame % 300 == 0 && g_bg_n) {   // what the pipeline workers did in the last 300 frames
+        uint64_t n = atomic_exchange(&g_bg_n, 0), ns = atomic_exchange(&g_bg_ns, 0), w = atomic_exchange(&g_n_pipe_waited, 0), sk = atomic_exchange(&g_n_pipe_wait_skip, 0), mu = atomic_exchange(&g_n_pipe_must, 0);
+        VLOG("pipelines: %llu built over the last 300 frames, %.1f ms each; draws that waited for one %llu (%llu of them in passes with no depth image, which are never skipped), skipped until it was ready %llu", (unsigned long long)n, n ? ns / 1e6 / (double)n : 0.0, (unsigned long long)w, (unsigned long long)mu, (unsigned long long)sk);
     }
-    free(d);
+    uint64_t made = g_n_pipelines + g_n_cpipes_all();
+    if (!g_pcache || frame % 300 || made == g_pcache_saved_n || atomic_load(&g_pcache_writing)) return;
+    size_t n = 0; if (vkGetPipelineCacheData(g_vk.dev, g_pcache, &n, NULL) || !n) return;
+    if (n == g_pcache_saved_size) { g_pcache_saved_n = made; return; }   // only cache hits since the last save: nothing new to write
+    pcache_job *j = malloc(sizeof *j); void *d = malloc(n); if (!j || !d) { free(j); free(d); return; }
+    if (vkGetPipelineCacheData(g_vk.dev, g_pcache, &n, d)) { free(j); free(d); return; }
+    *j = (pcache_job){d, n, made}; atomic_store(&g_pcache_writing, 1);
+    pthread_t th; if (pthread_create(&th, NULL, pcache_write, j)) { pcache_write(j); } else pthread_detach(th);
+    g_pcache_saved_n = made; g_pcache_saved_size = n;
 }
 static VkDescriptorSetLayout g_empty_dsl;
 typedef struct { VkDescriptorSetLayout l[3]; VkPipelineLayout pl; } plent;
@@ -1113,14 +1135,144 @@ static VkShaderModule int_mod(shd *sh, uint64_t u, uint64_t sg) {
     return m;
 }
 
+// ---------- The pipeline list ($DM_ROOT/vk_pipeline_list.bin; DM_VK_PIPE_LIST=0 turns it off) ----------
+// Every graphics and compute pipeline the game asks for, recorded once across runs: the recipe to build it again before play (a prebuild at start, and a list shipped
+// with the game profile, the Vulkan counterpart of the Mac's pso_manifest.tsv). The Switch 2 never compiles at run time (its shaders ship as machine code and NVN binds
+// state separately); here every new shader + state combination is a pipeline the driver compiles (about 28 ms on the Adreno 830), so first visits stuttered.
+// File: header {"DMPL", version, sizeof(pkey)}, then records {kind, vs, ps, gs, body}: kind 1 graphics (body: the pkey with its shader pointers cleared), kind 2
+// compute (vs = the compute shader, body: its two integer-slot masks). A header of another version or key size is set aside as .old and a new list started
+enum { PLIST_VERSION = 1 };
+typedef struct { uint32_t kind, pad; uint64_t vs, ps, gs; } plist_rec;
+static FILE *g_pl_f; static int g_pl_on = -1; static uint64_t *g_pl_set; static size_t g_pl_n, g_pl_cap; static uint64_t g_pl_new;
+static uint64_t plist_hash(const plist_rec *r, const void *body, size_t n) {
+    uint64_t h = 1469598103934665603ull; const uint8_t *p = (const uint8_t *)r;
+    for (size_t i = 0; i < sizeof *r; i++) h = (h ^ p[i]) * 1099511628211ull;
+    p = body; for (size_t i = 0; i < n; i++) h = (h ^ p[i]) * 1099511628211ull;
+    return h ? h : 1;
+}
+static int plist_insert(uint64_t h) {   // 1 when new
+    if ((g_pl_n + 1) * 2 > g_pl_cap) {
+        size_t nc = g_pl_cap ? g_pl_cap * 2 : 4096; uint64_t *ns = calloc(nc, sizeof *ns); if (!ns) return 0;
+        for (size_t i = 0; i < g_pl_cap; i++) if (g_pl_set[i]) { size_t j = g_pl_set[i] & (nc - 1); while (ns[j]) j = (j + 1) & (nc - 1); ns[j] = g_pl_set[i]; }
+        free(g_pl_set); g_pl_set = ns; g_pl_cap = nc;
+    }
+    size_t j = h & (g_pl_cap - 1); while (g_pl_set[j]) { if (g_pl_set[j] == h) return 0; j = (j + 1) & (g_pl_cap - 1); }
+    g_pl_set[j] = h; g_pl_n++; return 1;
+}
+static size_t plist_body(uint32_t kind) { return kind == 1 ? sizeof(pkey) : kind == 2 ? 2 * sizeof(uint64_t) : 0; }
+static int plist_open(void) {
+    if (g_pl_on >= 0) return g_pl_on;
+    const char *e = getenv("DM_VK_PIPE_LIST"); g_pl_on = 0; if (e && e[0] == '0') return 0;
+    char p[600]; snprintf(p, sizeof p, "%s/vk_pipeline_list.bin", getenv("DM_ROOT") ? getenv("DM_ROOT") : ".");
+    uint32_t want[3] = {0x4c504d44u /* "DMPL" */, PLIST_VERSION, (uint32_t)sizeof(pkey)}, have[3] = {0, 0, 0};
+    FILE *f = fopen(p, "rb"); size_t recs = 0;
+    if (f) {
+        if (fread(have, sizeof have, 1, f) == 1 && !memcmp(have, want, sizeof want)) {
+            plist_rec r; uint8_t body[sizeof(pkey) + 16];
+            while (fread(&r, sizeof r, 1, f) == 1) { size_t n = plist_body(r.kind); if (!n || fread(body, n, 1, f) != 1) break; plist_insert(plist_hash(&r, body, n)); recs++; }
+            fclose(f);
+        } else { fclose(f); char o[620]; snprintf(o, sizeof o, "%s.old", p); rename(p, o); VLOG("pipeline list: %s is of another version or key size: kept as %s, a new list started", p, o); }
+    }
+    g_pl_f = fopen(p, "ab");
+    if (!g_pl_f) { VLOG("[RED] pipeline list: cannot write %s", p); return 0; }
+    if (!recs && ftell(g_pl_f) == 0) fwrite(want, sizeof want, 1, g_pl_f);
+    VLOG("pipeline list: %zu pipelines known from earlier runs (%s); new ones are added", recs, p);
+    return g_pl_on = 1;
+}
+static void plist_add(uint32_t kind, uint64_t a, uint64_t b, uint64_t c, const void *body) {
+    if (!plist_open()) return;
+    plist_rec r = {kind, 0, a, b, c}; size_t n = plist_body(kind);
+    if (!plist_insert(plist_hash(&r, body, n))) return;
+    if (fwrite(&r, sizeof r, 1, g_pl_f) == 1 && fwrite(body, n, 1, g_pl_f) == 1) { fflush(g_pl_f); g_pl_new++; }
+}
+static void plist_add_graphics(const pkey *k) {
+    pkey c = *k; c.vs = c.ps = c.gs = NULL;
+    plist_add(1, k->vs ? k->vs->key : 0, k->ps ? k->ps->key : 0, k->gs ? k->gs->key : 0, &c);
+}
+static void plist_add_compute(const shd *cs, uint64_t imu, uint64_t ims) { uint64_t m[2] = {imu, ims}; plist_add(2, cs->key, 0, 0, m); }
+
+// ---------- Graphics pipelines built by worker threads ----------
+// A pipeline the driver has not compiled before takes about 28 ms on the Adreno 830, and a scene's first visit asks for dozens in one frame: Fire Emblem Fortune's
+// Weave froze for up to 1.9 s after its tutorial (logs_mem3/log_perf1.txt: 343 pipelines, 10.2 s over the frame budget in 3.5 minutes; with the driver's cache warm,
+// 0.2 s). The recording thread still prepares what is cheap (layout, shader variants) and hands the driver call to one of PIPE_WORKERS threads (Vulkan lets several
+// threads create pipelines into one cache: it is not made externally synchronized). A draw waits for its pipeline while the frame's waiting budget lasts
+// (DM_VK_PIPE_WAIT_MS, default 4), else it is skipped this frame and drawn once the pipeline is ready: on a first visit an object may appear a frame or two late, or
+// leave a short-lived hole where the depth pre-pass and the G-buffer pass disagree. A draw in a pass with no depth image always waits (pipe_wait). DM_VK_ASYNC_PIPE=0 builds on the recording thread, as before. Compute pipelines
+// stay synchronous: a skipped dispatch can leave lasting wrong results (exposure, histograms)
+enum { PIPE_WORKERS = 3 };
+typedef struct pjob {
+    struct pjob *next; pent *e;
+    VkPipelineShaderStageCreateInfo st[3]; VkPipelineVertexInputStateCreateInfo vi; VkPipelineInputAssemblyStateCreateInfo ia; VkPipelineViewportDepthClipControlCreateInfoEXT dcc;
+    VkPipelineViewportStateCreateInfo vp; VkPipelineRasterizationStateCreateInfo rs; VkPipelineMultisampleStateCreateInfo ms; VkPipelineDepthStencilStateCreateInfo ds;
+    VkPipelineColorBlendAttachmentState ba[8]; VkPipelineColorBlendStateCreateInfo cb; VkPipelineDynamicStateCreateInfo dy; VkFormat cf[8]; VkPipelineRenderingCreateInfo ri;
+    VkGraphicsPipelineCreateInfo gi;
+} pjob;
+static pthread_mutex_t g_pq_mu = PTHREAD_MUTEX_INITIALIZER; static pthread_cond_t g_pq_cv = PTHREAD_COND_INITIALIZER, g_pdone_cv = PTHREAD_COND_INITIALIZER;
+static pjob *g_pq_head, *g_pq_tail;
+static int async_pipe_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_VK_ASYNC_PIPE"); v = !(e && e[0] == '0'); } return v; }
+static uint64_t pipe_wait_budget_ns(void) { static int64_t v = -1; if (v < 0) { const char *e = getenv("DM_VK_PIPE_WAIT_MS"); v = (int64_t)((e ? atof(e) : 4.0) * 1e6); if (v < 0) v = 0; } return (uint64_t)v; }
+static void pjob_run(pjob *j) {
+    uint64_t t0 = vkx_now_ns(); VkPipeline p = VK_NULL_HANDLE;
+    VkResult r = vkCreateGraphicsPipelines(g_vk.dev, g_pcache, 1, &j->gi, NULL, &p);
+    g_bg_ns += vkx_now_ns() - t0; g_bg_n++;
+    pthread_mutex_lock(&g_pq_mu);
+    if (r) { p = VK_NULL_HANDLE; g_n_pipe_fail++; VLOG("[RED] pipeline for shaders %016llx / %016llx failed (%d)", (unsigned long long)j->e->k.vs->key, j->e->k.ps ? (unsigned long long)j->e->k.ps->key : 0ull, r); }
+    j->e->p = p; atomic_store(&j->e->building, 0); pthread_cond_broadcast(&g_pdone_cv);
+    pthread_mutex_unlock(&g_pq_mu);
+    free(j);
+}
+static void *pipe_worker(void *unused) {
+    (void)unused;
+    for (;;) {
+        pthread_mutex_lock(&g_pq_mu);
+        while (!g_pq_head) pthread_cond_wait(&g_pq_cv, &g_pq_mu);
+        pjob *j = g_pq_head; g_pq_head = j->next; if (!g_pq_head) g_pq_tail = NULL;
+        pthread_mutex_unlock(&g_pq_mu);
+        pjob_run(j);
+    }
+    return NULL;
+}
+static int pipe_workers_start(void) {
+    static int ok = -1; if (ok >= 0) return ok;
+    ok = 0; for (int i = 0; i < PIPE_WORKERS; i++) { pthread_t t; if (!pthread_create(&t, NULL, pipe_worker, NULL)) { pthread_detach(t); ok = 1; } }
+    VLOG("pipelines: %s", ok ? "built by worker threads; a draw waits up to the frame's budget, then is skipped until its pipeline is ready (DM_VK_ASYNC_PIPE=0: on the recording thread)" : "[RED] no worker thread: built on the recording thread");
+    return ok;
+}
+// a pipeline still being built: wait while this frame's budget lasts. Returns the entry once ready (NULL if its build failed), or NULL to skip the draw this frame
+static pent *pipe_wait(pent *e) {
+    static uint64_t frame = ~0ull, used;
+    uint64_t f = vkx_frame(); if (f != frame) { frame = f; used = 0; }
+    if (atomic_load(&e->building)) {
+        uint64_t b = pipe_wait_budget_ns(), left = used < b ? b - used : 0;
+        if (!e->k.d_on && !e->k.s_on) {   // a pass with no depth image: a full-screen step (lighting, combining, tone mapping) or the interface. Skipped, the whole picture is
+                                           // black or stale for the frame (log_blackzoom.txt: up to 954 draws skipped in 300 frames with a cold cache, a black flash on first zoom), so it waits
+            uint64_t t0 = vkx_now_ns();
+            pthread_mutex_lock(&g_pq_mu); while (atomic_load(&e->building)) pthread_cond_wait(&g_pdone_cv, &g_pq_mu); pthread_mutex_unlock(&g_pq_mu);
+            uint64_t d = vkx_now_ns() - t0; used += d; vkx_sb_time(3, d); g_n_pipe_waited++; g_n_pipe_must++;
+        } else if (left) {
+            uint64_t t0 = vkx_now_ns(); struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts);
+            uint64_t dl = (uint64_t)ts.tv_nsec + left; ts.tv_sec += (time_t)(dl / 1000000000ull); ts.tv_nsec = (long)(dl % 1000000000ull);
+            pthread_mutex_lock(&g_pq_mu);
+            while (atomic_load(&e->building)) if (pthread_cond_timedwait(&g_pdone_cv, &g_pq_mu, &ts)) break;
+            pthread_mutex_unlock(&g_pq_mu);
+            uint64_t d = vkx_now_ns() - t0; used += d; vkx_sb_time(3, d); g_n_pipe_waited++;
+        }
+        if (atomic_load(&e->building)) { g_n_pipe_wait_skip++; return NULL; }
+    }
+    return e->p ? e : NULL;
+}
 static pent *pipeline_of(const pkey *k) {
     uint32_t h = 2166136261u; const uint8_t *q = (const uint8_t *)k; for (size_t i = 0; i < sizeof *k; i++) h = (h ^ q[i]) * 16777619u;
     pent **b = &g_pipe[h & (NPIPE - 1)];
-    for (pent *e = *b; e; e = e->next) if (!memcmp(&e->k, k, sizeof *k)) return e->p ? e : NULL;
+    for (pent *e = *b; e; e = e->next) if (!memcmp(&e->k, k, sizeof *k)) return atomic_load(&e->building) ? pipe_wait(e) : e->p ? e : NULL;
     pent *e = calloc(1, sizeof *e); e->k = *k; e->next = *b; *b = e;
     pcache_open();
+    uint64_t pc0 = vkx_now_ns();
     e->pl = layout_of(k->vs, k->ps, k->gs); if (!e->pl) { g_n_pipe_fail++; return NULL; }
-    VkPipelineShaderStageCreateInfo st[3]; uint32_t ns = 0;
+    plist_add_graphics(k);
+    pjob *j = calloc(1, sizeof *j); if (!j) { g_n_pipe_fail++; return NULL; }
+    j->e = e;
+    VkPipelineShaderStageCreateInfo *st = j->st; uint32_t ns = 0;
     VkShaderModule vmod = k->vs->mod;
     if (k->ps && !k->gs && (k->ps->in_mask & ~k->vs->out_mask)) vmod = vs_variant(k->vs, k->ps->in_mask & ~k->vs->out_mask);
     if (k->imu[0] | k->ims[0]) {   // integer slots (int_mod) on top of the base module; a vertex shader needing extra outputs as well keeps those (rare: logged)
@@ -1135,15 +1287,15 @@ static pent *pipeline_of(const pkey *k) {
     st[ns++] = (VkPipelineShaderStageCreateInfo){VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, NULL, 0, VK_SHADER_STAGE_VERTEX_BIT, vmod, "main", NULL};
     if (k->gs) st[ns++] = (VkPipelineShaderStageCreateInfo){VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, NULL, 0, VK_SHADER_STAGE_GEOMETRY_BIT, int_mod(k->gs, k->imu[2], k->ims[2]), "main", NULL};
     if (k->ps) st[ns++] = (VkPipelineShaderStageCreateInfo){VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, NULL, 0, VK_SHADER_STAGE_FRAGMENT_BIT, pmod, "main", NULL};
-    VkPipelineVertexInputStateCreateInfo vi = {VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
-    VkPipelineInputAssemblyStateCreateInfo ia = {VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO, NULL, 0, (VkPrimitiveTopology)k->topo, VK_FALSE};
-    VkPipelineViewportDepthClipControlCreateInfoEXT dcc = {VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_DEPTH_CLIP_CONTROL_CREATE_INFO_EXT, NULL, VK_TRUE};
-    VkPipelineViewportStateCreateInfo vp = {VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO, k->clip_m1 ? &dcc : NULL, 0, 1, NULL, 1, NULL};
-    VkPipelineRasterizationStateCreateInfo rs = {VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO, NULL, 0, k->depth_clamp, VK_FALSE,
+    j->vi = (VkPipelineVertexInputStateCreateInfo){VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+    j->ia = (VkPipelineInputAssemblyStateCreateInfo){VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO, NULL, 0, (VkPrimitiveTopology)k->topo, VK_FALSE};
+    j->dcc = (VkPipelineViewportDepthClipControlCreateInfoEXT){VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_DEPTH_CLIP_CONTROL_CREATE_INFO_EXT, NULL, VK_TRUE};
+    j->vp = (VkPipelineViewportStateCreateInfo){VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO, k->clip_m1 ? &j->dcc : NULL, 0, 1, NULL, 1, NULL};
+    j->rs = (VkPipelineRasterizationStateCreateInfo){VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO, NULL, 0, k->depth_clamp, VK_FALSE,
         k->poly_mode == NVN_POLYGON_MODE_POINT ? VK_POLYGON_MODE_POINT : k->poly_mode == NVN_POLYGON_MODE_LINE ? VK_POLYGON_MODE_LINE : VK_POLYGON_MODE_FILL, VK_CULL_MODE_NONE, VK_FRONT_FACE_COUNTER_CLOCKWISE, VK_FALSE, 0, 0, 0, 1};
-    VkPipelineMultisampleStateCreateInfo ms = {VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO, NULL, 0, (VkSampleCountFlagBits)k->samples, VK_FALSE, 0, NULL, k->a2c, VK_FALSE};
-    VkPipelineDepthStencilStateCreateInfo ds = {VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
-    VkPipelineColorBlendAttachmentState ba[8];
+    j->ms = (VkPipelineMultisampleStateCreateInfo){VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO, NULL, 0, (VkSampleCountFlagBits)k->samples, VK_FALSE, 0, NULL, k->a2c, VK_FALSE};
+    j->ds = (VkPipelineDepthStencilStateCreateInfo){VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
+    VkPipelineColorBlendAttachmentState *ba = j->ba;
     for (uint32_t i = 0; i < k->ncol; i++) {
         const blend_st *bs = &k->blend[i];
         ba[i] = (VkPipelineColorBlendAttachmentState){(k->blend_en >> i & 1) ? VK_TRUE : VK_FALSE, bf_vk(bs->src_rgb), bf_vk(bs->dst_rgb), beq_vk(bs->eq_rgb), bf_vk(bs->src_a), bf_vk(bs->dst_a), beq_vk(bs->eq_a),
@@ -1151,15 +1303,21 @@ static pent *pipeline_of(const pkey *k) {
         if (bs->eq_rgb == NVN_BLEND_EQUATION_MIN || bs->eq_rgb == NVN_BLEND_EQUATION_MAX) { ba[i].srcColorBlendFactor = ba[i].dstColorBlendFactor = VK_BLEND_FACTOR_ONE; }
         if (bs->eq_a == NVN_BLEND_EQUATION_MIN || bs->eq_a == NVN_BLEND_EQUATION_MAX) { ba[i].srcAlphaBlendFactor = ba[i].dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE; }
     }
-    VkPipelineColorBlendStateCreateInfo cb = {VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO, NULL, 0, k->logic_op != NVN_LOGIC_OP_COPY, (VkLogicOp)k->logic_op, k->ncol, ba, {0, 0, 0, 0}};
-    VkPipelineDynamicStateCreateInfo dy = {VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO, NULL, 0, sizeof k_dyn / sizeof *k_dyn - (g_vk.vi_dyn ? 0 : 1), k_dyn};
-    VkFormat cf[8]; for (uint32_t i = 0; i < k->ncol; i++) cf[i] = (VkFormat)k->col_fmt[i];
-    VkPipelineRenderingCreateInfo ri = {VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO, NULL, 0, k->ncol, cf, k->d_on ? (VkFormat)k->ds_fmt : VK_FORMAT_UNDEFINED, k->s_on ? (VkFormat)k->ds_fmt : VK_FORMAT_UNDEFINED};
-    VkGraphicsPipelineCreateInfo gi = {VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, &ri, 0, ns, st, &vi, &ia, NULL, &vp, &rs, &ms, &ds, &cb, &dy, e->pl, VK_NULL_HANDLE, 0, VK_NULL_HANDLE, -1};
-    uint64_t pc0 = vkx_now_ns(); VkResult r = vkCreateGraphicsPipelines(g_vk.dev, g_pcache, 1, &gi, NULL, &e->p); vkx_sb_note(3, vkx_now_ns() - pc0);
-    if (r) { e->p = VK_NULL_HANDLE; g_n_pipe_fail++; VLOG("[RED] pipeline for shaders %016llx / %016llx failed (%d)", (unsigned long long)k->vs->key, k->ps ? (unsigned long long)k->ps->key : 0ull, r); return NULL; }
+    j->cb = (VkPipelineColorBlendStateCreateInfo){VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO, NULL, 0, k->logic_op != NVN_LOGIC_OP_COPY, (VkLogicOp)k->logic_op, k->ncol, ba, {0, 0, 0, 0}};
+    j->dy = (VkPipelineDynamicStateCreateInfo){VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO, NULL, 0, sizeof k_dyn / sizeof *k_dyn - (g_vk.vi_dyn ? 0 : 1), k_dyn};
+    for (uint32_t i = 0; i < k->ncol; i++) j->cf[i] = (VkFormat)k->col_fmt[i];
+    j->ri = (VkPipelineRenderingCreateInfo){VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO, NULL, 0, k->ncol, j->cf, k->d_on ? (VkFormat)k->ds_fmt : VK_FORMAT_UNDEFINED, k->s_on ? (VkFormat)k->ds_fmt : VK_FORMAT_UNDEFINED};
+    j->gi = (VkGraphicsPipelineCreateInfo){VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, &j->ri, 0, ns, j->st, &j->vi, &j->ia, NULL, &j->vp, &j->rs, &j->ms, &j->ds, &j->cb, &j->dy, e->pl, VK_NULL_HANDLE, 0, VK_NULL_HANDLE, -1};
     g_n_pipelines++;
-    return e;
+    if (async_pipe_on() && pipe_workers_start()) {   // to a worker: wait for it within the frame's budget (pipe_wait)
+        atomic_store(&e->building, 1);
+        pthread_mutex_lock(&g_pq_mu); if (g_pq_tail) g_pq_tail->next = j; else g_pq_head = j; g_pq_tail = j; pthread_cond_signal(&g_pq_cv); pthread_mutex_unlock(&g_pq_mu);
+        vkx_sb_note(3, vkx_now_ns() - pc0);
+        return pipe_wait(e);
+    }
+    pjob_run(j);   // on this thread (DM_VK_ASYNC_PIPE=0)
+    vkx_sb_note(3, vkx_now_ns() - pc0);
+    return e->p ? e : NULL;
 }
 
 // ---------- Vertex formats ----------
@@ -1729,7 +1887,7 @@ static cpent *cpipe_of(shd *cs) {
     cpent *e = calloc(1, sizeof *e); e->cs = cs; e->imu = cs->imask_u; e->ims = cs->imask_s; e->next = *b; *b = e;
     VkPipelineLayoutCreateInfo li = {VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, NULL, 0, 1, &cs->dsl};
     if (vkCreatePipelineLayout(g_vk.dev, &li, NULL, &e->pl)) { e->failed = 1; return NULL; }
-    pcache_open();
+    pcache_open(); plist_add_compute(cs, e->imu, e->ims);
     VkPipelineShaderStageRequiredSubgroupSizeCreateInfo rsg = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO, NULL, 64};   // see nvn_vk_mem.c "Subgroup size"
     VkComputePipelineCreateInfo ci = {VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO, NULL, 0,
         {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, g_vk.sg_pin_cs ? &rsg : NULL, 0, VK_SHADER_STAGE_COMPUTE_BIT, int_mod(cs, e->imu, e->ims), "main", NULL}, e->pl, VK_NULL_HANDLE, -1};
@@ -1784,6 +1942,7 @@ void vkd_dispatch(sub_t *s, const void *rec, uint32_t size) {
 // driver does not offer the blit for the formats (depth formats here) and for the DLSS stand-in: runs with blits on this driver lost the device (a scaled D32 blit
 // preceded every hang), so a draw, the path the game's own frames take, stands in
 #include "nvn_vk_blit_spv.h"
+#include "nvn_vk_reactive_spv.h"   // shaders/reactive.comp: FSR 2's reactive mask (reactive_run)
 static VkShaderModule g_st_vs, g_st_fs, g_st_fsd; static VkDescriptorSetLayout g_st_dsl; static VkPipelineLayout g_st_pl;
 typedef struct { VkFormat f; int depth; VkPipeline p; } st_pipe;
 static st_pipe g_st_pipes[16]; static int g_nst;
@@ -1884,6 +2043,92 @@ int vkd_stretch(sub_t *s, vk_tex *in, uint32_t il, uint32_t iy_layer, const int3
 
 // ---------- DLSS: the game's temporal upscale (the Mac's MetalFX scaler): FSR 2 (dm/third_party/fsr2 via fsr2_glue.cpp); the stretch stand-in draws what FSR 2 cannot take ----------
 static uint64_t g_n_dlss, g_n_dlss_st, g_n_dlss_fsr;
+// ---------- FSR 2's reactive mask (shaders/reactive.comp; DM_FSR2_REACTIVE=0 turns it off) ----------
+// Fire Emblem Fortune's Weave gives moving objects a previous transform equal to the current one, so their motion vectors are zero, and FSR 2 kept their old
+// positions: ghosting behind turning gears and walking characters (the captures logs_mem3/002156 and 000778; the Eden fork notes the same ghosting with the
+// game's own DLSS network). This pass marks where the picture changed since the last frame at the place the motion vector points to, and FSR 2 trusts its
+// history less there. DM_FSR2_REACTIVE_T0 / _T1: the relative brightness change where the mask starts and where it is full (default 0.06, 0.2);
+// DM_FSR2_REACTIVE_MAX: its strongest value (default 0.9; 1 would drop the history entirely)
+static struct { VkPipeline p; VkPipelineLayout pl; VkDescriptorSetLayout dsl; VkImage img[3]; VkDeviceMemory mem[3]; VkImageView view[3]; uint32_t w, h; int cur, have_prev, state; } g_ra;
+static float g_ra_t0, g_ra_t1, g_ra_max, g_ra_decay;
+static int ra_mem_type(uint32_t bits) {
+    VkPhysicalDeviceMemoryProperties mp; vkGetPhysicalDeviceMemoryProperties(g_vk.pd, &mp);
+    for (uint32_t i = 0; i < mp.memoryTypeCount; i++) if ((bits >> i & 1) && (mp.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) return (int)i;
+    for (uint32_t i = 0; i < mp.memoryTypeCount; i++) if (bits >> i & 1) return (int)i;
+    return -1;
+}
+static int ra_setup(void) {   // once: the switches, the format check and the pipeline. 1 when the pass can run
+    if (g_ra.state) return g_ra.state > 0;
+    g_ra.state = -1;
+    const char *e = getenv("DM_FSR2_REACTIVE"); if (e && e[0] == '0') { VLOG("DLSS: no reactive mask (DM_FSR2_REACTIVE=0)"); return 0; }
+    e = getenv("DM_FSR2_REACTIVE_T0"); g_ra_t0 = e ? (float)atof(e) : 0.06f;
+    e = getenv("DM_FSR2_REACTIVE_T1"); g_ra_t1 = e ? (float)atof(e) : 0.2f;
+    e = getenv("DM_FSR2_REACTIVE_MAX"); g_ra_max = e ? (float)atof(e) : 0.9f;
+    e = getenv("DM_FSR2_REACTIVE_DECAY"); g_ra_decay = e ? (float)atof(e) : 0.85f;   // the share of last frame's mask kept: about ten frames to fade
+    VkFormat need[2] = {VK_FORMAT_R8_UNORM, VK_FORMAT_R16_SFLOAT};
+    for (int i = 0; i < 2; i++) { VkFormatProperties fp; vkGetPhysicalDeviceFormatProperties(g_vk.pd, need[i], &fp);
+        if (!(fp.optimalTilingFeatures & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT) || !(fp.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT)) { VLOG("[RED] DLSS: no reactive mask: format %d cannot be a storage image here", need[i]); return 0; } }
+    if (!vkCmdPushDescriptorSetKHR) { VLOG("[RED] DLSS: no reactive mask: push descriptors are not available"); return 0; }
+    VkDescriptorSetLayoutBinding b[5];
+    for (uint32_t i = 0; i < 5; i++) b[i] = (VkDescriptorSetLayoutBinding){i, i < 3 ? VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER : VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL};
+    VkDescriptorSetLayoutCreateInfo dli = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, NULL, VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR, 5, b};
+    VkPushConstantRange pr = {VK_SHADER_STAGE_COMPUTE_BIT, 0, 28};
+    VkShaderModuleCreateInfo mi = {VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, NULL, 0, sizeof k_reactive_comp, k_reactive_comp};
+    VkShaderModule m;
+    if (vkCreateDescriptorSetLayout(g_vk.dev, &dli, NULL, &g_ra.dsl) || vkCreateShaderModule(g_vk.dev, &mi, NULL, &m)) { VLOG("[RED] DLSS: no reactive mask: its layout or shader failed"); return 0; }
+    VkPipelineLayoutCreateInfo pli = {VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, NULL, 0, 1, &g_ra.dsl, 1, &pr};
+    VkComputePipelineCreateInfo ci = {VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO, NULL, 0, {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, NULL, 0, VK_SHADER_STAGE_COMPUTE_BIT, m, "main", NULL},
+                                      VK_NULL_HANDLE, VK_NULL_HANDLE, -1};
+    int ok = !vkCreatePipelineLayout(g_vk.dev, &pli, NULL, &g_ra.pl) && (ci.layout = g_ra.pl, !vkCreateComputePipelines(g_vk.dev, VK_NULL_HANDLE, 1, &ci, NULL, &g_ra.p));
+    vkDestroyShaderModule(g_vk.dev, m, NULL);
+    if (!ok) { VLOG("[RED] DLSS: no reactive mask: its pipeline failed"); return 0; }
+    VLOG("DLSS: reactive mask on: brightness change from %.2f to %.2f of the pixel's level, up to %.2f, %.2f of it kept each next frame; also as the transparency and composition mask (DM_FSR2_REACTIVE, _T0, _T1, _MAX, _DECAY)",
+         g_ra_t0, g_ra_t1, g_ra_max, g_ra_decay);
+    g_ra.state = 1; return 1;
+}
+static int ra_images(VkCommandBuffer cb, uint32_t w, uint32_t h) {   // the mask and the two brightness histories at the render size
+    if (g_ra.img[0] && g_ra.w == w && g_ra.h == h) return 1;
+    if (g_ra.img[0]) { vkDeviceWaitIdle(g_vk.dev); for (int i = 0; i < 3; i++) { vkDestroyImageView(g_vk.dev, g_ra.view[i], NULL); vkDestroyImage(g_vk.dev, g_ra.img[i], NULL); vkFreeMemory(g_vk.dev, g_ra.mem[i], NULL); g_ra.img[i] = VK_NULL_HANDLE; } }
+    VkImageMemoryBarrier ib[3];
+    for (int i = 0; i < 3; i++) {
+        VkFormat f = i ? VK_FORMAT_R16_SFLOAT : VK_FORMAT_R8_UNORM;
+        VkImageCreateInfo ii = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, NULL, 0, VK_IMAGE_TYPE_2D, f, {w, h, 1}, 1, 1, VK_SAMPLE_COUNT_1_BIT, VK_IMAGE_TILING_OPTIMAL,
+                                VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT, VK_SHARING_MODE_EXCLUSIVE, 0, NULL, VK_IMAGE_LAYOUT_UNDEFINED};
+        if (vkCreateImage(g_vk.dev, &ii, NULL, &g_ra.img[i])) { g_ra.img[i] = VK_NULL_HANDLE; return 0; }
+        VkMemoryRequirements mr; vkGetImageMemoryRequirements(g_vk.dev, g_ra.img[i], &mr); int t = ra_mem_type(mr.memoryTypeBits);
+        VkMemoryAllocateInfo mai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, NULL, mr.size, (uint32_t)(t < 0 ? 0 : t)};
+        if (t < 0 || vkAllocateMemory(g_vk.dev, &mai, NULL, &g_ra.mem[i]) || vkBindImageMemory(g_vk.dev, g_ra.img[i], g_ra.mem[i], 0)) return 0;
+        VkImageViewCreateInfo vi = {VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, NULL, 0, g_ra.img[i], VK_IMAGE_VIEW_TYPE_2D, f, {0, 0, 0, 0}, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}};
+        if (vkCreateImageView(g_vk.dev, &vi, NULL, &g_ra.view[i])) return 0;
+        ib[i] = (VkImageMemoryBarrier){VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, NULL, 0, VK_ACCESS_SHADER_WRITE_BIT, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
+                                       VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, g_ra.img[i], {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}};
+    }
+    vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, NULL, 0, NULL, 3, ib);
+    g_ra.w = w; g_ra.h = h; g_ra.have_prev = 0; g_ra.cur = 0;
+    return 1;
+}
+// records the mask for this DLSS call into the submission (after the game's draws, before FSR 2) and gives it to the job; nothing when it cannot run
+static void reactive_run(sub_t *s, fsr2_job *j) {
+    if (!ra_setup() || !ra_images(s->cb, j->iw, j->ih)) return;
+    int prev = 1 + (g_ra.cur ^ 1), cur = 1 + g_ra.cur;
+    VkSampler smp = vkd_linear_sampler();
+    VkDescriptorImageInfo ii[5] = {{smp, j->color_v, VK_IMAGE_LAYOUT_GENERAL}, {smp, j->motion_v, VK_IMAGE_LAYOUT_GENERAL}, {smp, g_ra.view[prev], VK_IMAGE_LAYOUT_GENERAL},
+                                   {VK_NULL_HANDLE, g_ra.view[0], VK_IMAGE_LAYOUT_GENERAL}, {VK_NULL_HANDLE, g_ra.view[cur], VK_IMAGE_LAYOUT_GENERAL}};
+    VkWriteDescriptorSet w[5];
+    for (uint32_t i = 0; i < 5; i++) w[i] = (VkWriteDescriptorSet){VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, VK_NULL_HANDLE, i, 0, 1,
+                                                                 i < 3 ? VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER : VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &ii[i], NULL, NULL};
+    struct { int32_t w, h; float t0, t1, rmax; int32_t first; float decay; } pc = {(int32_t)j->iw, (int32_t)j->ih, g_ra_t0, g_ra_t1, g_ra_max, (j->reset || !g_ra.have_prev) ? 1 : 0, g_ra_decay};
+    barrier_all(s->cb);   // last frame's FSR 2 read of the mask and this frame's draws of colour and motion
+    vkCmdBindPipeline(s->cb, VK_PIPELINE_BIND_POINT_COMPUTE, g_ra.p);
+    vkCmdPushDescriptorSetKHR(s->cb, VK_PIPELINE_BIND_POINT_COMPUTE, g_ra.pl, 0, 5, w);
+    vkCmdPushConstants(s->cb, g_ra.pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof pc, &pc);
+    vkCmdDispatch(s->cb, (j->iw + 7) / 8, (j->ih + 7) / 8, 1);
+    barrier_all(s->cb);
+    g_ra.cur ^= 1; g_ra.have_prev = 1;
+    vkx_ring_mask(s, g_ra.img[0], j->iw, j->ih);   // DM_VK_RING_DLSS: the mask as FSR 2 gets it
+    j->reactive = g_ra.img[0]; j->reactive_v = g_ra.view[0];
+}
+
 void vkd_dlss(sub_t *s, const void *a) {
     const p_dlss *c = a;
     { static int off = -1; if (off < 0) off = getenv("DM_VK_NO_DLSS") != NULL; if (off) return; }
@@ -1895,6 +2140,7 @@ void vkd_dlss(sub_t *s, const void *a) {
     if (!vkx_ring_final()) vkx_ring_record(s, in, dep);   // DM_VK_RING: the scene before upscaling, for the rolling capture
     vk_tex *mot = c->tex[DLSS_MOTION] ? tex_for_read(c->tex[DLSS_MOTION], s) : NULL;
     vk_tex *expo = c->tex[DLSS_EXPOSURE] ? tex_for_read(c->tex[DLSS_EXPOSURE], s) : NULL;
+    vkx_ring_dlss(s, in, mot, dep, c->jitter, c->mv);   // DM_VK_RING_DLSS: these inputs as FSR 2 reads them
     if (c->tex[DLSS_BIAS]) VRED_ONCE("DLSS: the game's bias mask is not used by FSR 2 (as the Mac's MetalFX path does not use it)");
     int32_t iw = c->iw > 0 ? c->iw : (int32_t)in->w, ih = c->ih > 0 ? c->ih : (int32_t)in->h;
     int32_t ow = c->ow > 0 ? c->ow : (int32_t)out->w, oh = c->oh > 0 ? c->oh : (int32_t)out->h;
@@ -1947,6 +2193,7 @@ void vkd_dlss(sub_t *s, const void *a) {
         return;
     }
     barrier_all(s->cb);   // the game's last draws on these images, then FSR 2's dispatches into the submission's buffer (fsr2_glue.cpp)
+    reactive_run(s, &j);   // where the picture changed, FSR 2 trusts its history less (the game's moving objects have no motion vectors)
     if (!fsr2_dispatch(&j)) {   // an FFX error or a context that cannot be made: the stand-in still draws the frame
         if (!vkd_stretch(s, in, 0, 0, ir, out, 0, 0, orr, 1)) return;
         vkx_sublog(s, " DLSS");

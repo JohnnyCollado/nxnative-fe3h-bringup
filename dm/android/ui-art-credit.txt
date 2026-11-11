@@ -27,3 +27,13 @@ Credit line, in the form the license asks for:
    Licensed under CC BY 3.0 - https://zacksly.itch.io"
 
   Short form: "Button Icons and Controls by Zacksly (CC BY 3.0 Licensed | zacksly.itch.io)"
+
+BUTTON PROMPT FONTS (dm/tools/make_ext_font_icons.py)
+------------------------------------------------------
+
+dm/tools/make_ext_font_icons.py makes a stand-in for the Switch's button font from the same three packs, for games that draw their
+prompts with the system font. No such font is shipped in this app: Fire Emblem Fortune's Weave draws its prompts from its own font file.
+
+Modification statement (required by the license), for fonts made with that tool:
+  The pictures are MODIFIED: each PNG is traced into an outline (the edge of its alpha channel), scaled so a face button fills the
+  font's line, and centred. Shapes are not redrawn. The eight stick direction arrows in such a font are not from the packs.

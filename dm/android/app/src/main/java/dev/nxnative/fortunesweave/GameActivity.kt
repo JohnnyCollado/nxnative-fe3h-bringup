@@ -180,7 +180,7 @@ class GameActivity : Activity(), SurfaceHolder.Callback {
         val left = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             addView(TextView(this@GameActivity).apply {
-                text = "Paused"; setTextSize(android.util.TypedValue.COMPLEX_UNIT_DIP, 26f); letterSpacing = 0.08f; typeface = FeTheme.SERIF; setTextColor(FeTheme.BRIGHT); setPadding(0, 0, 0, dp(12))
+                text = if (FeTheme.game(this@GameActivity)) "PAUSED" else "Paused"; setTextSize(android.util.TypedValue.COMPLEX_UNIT_DIP, 26f); letterSpacing = if (FeTheme.game(this@GameActivity)) 0.3f else 0.08f; typeface = FeTheme.SERIF; setTextColor(if (FeTheme.game(this@GameActivity)) FeTheme.GOLD else FeTheme.BRIGHT); setPadding(0, 0, 0, dp(12))
                 FeTheme.art(this@GameActivity, "fe_dia_small")?.let { d -> d.setBounds(0, 0, dp(20), dp(20)); setCompoundDrawables(d, null, null, null); compoundDrawablePadding = dp(12) }
             })
             addView(FocusBox(this@GameActivity).apply { addView(LinearLayout(this@GameActivity).apply {
@@ -199,7 +199,7 @@ class GameActivity : Activity(), SurfaceHolder.Callback {
         }
         return FrameLayout(this).apply {
             // nearly opaque: the game is paused behind it and should not show through the menu
-            background = GradientDrawable().apply {
+            background = if (FeTheme.game(this@GameActivity)) FeTheme.backdrop(this@GameActivity, Color.argb(0xF0, 0x02, 0x09, 0x0b)) else GradientDrawable().apply {
                 gradientType = GradientDrawable.RADIAL_GRADIENT; gradientRadius = resources.displayMetrics.widthPixels * 0.75f; setGradientCenter(0.3f, 0.4f)
                 colors = intArrayOf(Color.argb(0xF2, 0x2a, 0x23, 0x50), Color.argb(0xF2, 0x16, 0x12, 0x2c), Color.argb(0xF5, 0x0e, 0x0b, 0x1d))
             }

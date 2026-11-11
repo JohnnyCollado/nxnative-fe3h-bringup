@@ -84,6 +84,12 @@ static void vk_init_once(void) {
     VkPhysicalDeviceVulkan12Features f12 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES, &f13};
     f12.timelineSemaphore = h12.timelineSemaphore; f12.shaderFloat16 = h12.shaderFloat16; f12.shaderInt8 = h12.shaderInt8; f12.scalarBlockLayout = h12.scalarBlockLayout;
     f12.descriptorIndexing = h12.descriptorIndexing; f12.runtimeDescriptorArray = h12.runtimeDescriptorArray; f12.descriptorBindingPartiallyBound = h12.descriptorBindingPartiallyBound;
+    {   // the Vulkan memory model, only when frame generation is on (DM_LSFG=1: the Lossless shaders need it, lsfg_glue.cpp). Turned on for every run it was
+        // the one device change before Fire Emblem Fortune's Weave's light culling went wrong in a triangle of tiles on the world map (logs_mem3/001253): kept off otherwise
+        const char *lf = getenv("DM_LSFG"); int want = lf && lf[0] == '1';
+        if (want) { f12.vulkanMemoryModel = h12.vulkanMemoryModel; f12.vulkanMemoryModelDeviceScope = h12.vulkanMemoryModelDeviceScope; }
+        g_vk.mem_model = want && h12.vulkanMemoryModel; g_vk.fp16 = h12.shaderFloat16;
+    }
     f12.drawIndirectCount = h12.drawIndirectCount; f12.hostQueryReset = h12.hostQueryReset; g_vk.host_qreset = h12.hostQueryReset; f12.shaderSubgroupExtendedTypes = h12.shaderSubgroupExtendedTypes;
     f12.uniformAndStorageBuffer8BitAccess = h12.uniformAndStorageBuffer8BitAccess; f12.storageBuffer8BitAccess = h12.storageBuffer8BitAccess;
     // the same extension structs, now asking for what the query found (vkGetPhysicalDeviceFeatures2 filled them in place)

@@ -47,7 +47,7 @@ For encrypted NSP or XCI inputs from original Switch games, a different build pa
 
 ## Build a Mac app
 
-Install the Apple build tools and Python dependencies listed in the main [README](../README.md#requirements). Then run this from the repository root, replacing the example folder with your own dump location:
+Install the Apple build tools and Python dependencies listed in [NxNative's README](https://github.com/seedds/nxnative#build-from-the-command-line) (macOS 26.6, Xcode 27.2, Homebrew, Python 3.12 and its packages). Then run this from the repository root, replacing the example folder with your own dump location:
 
 ```sh
 python3 scripts/build_ipa_from_nsp.py "/path/to/GAME_FOLDER" --platform mac-app

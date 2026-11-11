@@ -16,6 +16,7 @@ typedef struct {
     uint32_t sg_size, sg_min, sg_max; int sg_pin_cs, sg_full, host_qreset;   // host_qreset: query pools can be reset from the CPU (nvn_vk_exec.c prof_*)
     uint32_t ts_bits;   // the queue family's timestamp bits (0: no timestamps)
     int _prof_pad;   // the device's subgroup size and its range; compute pipelines are pinned to 64 lanes (what the shaders are translated for: vk_spirv.py SUBGROUP)
+    int mem_model, fp16;   // the Vulkan memory model and 16-bit float shaders turned on (what the Lossless frame generation shaders need)
     int vi_dyn, null_desc, clip_ctl, idx_u8, border, divisor;   // extension features turned on: vertex input dynamic state, robustness2 nullDescriptor, depth clip control,
                                                                 // 8-bit indices, custom border colours, vertex attribute divisors
 } vk_ctx;

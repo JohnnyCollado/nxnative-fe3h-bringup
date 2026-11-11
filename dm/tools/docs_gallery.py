@@ -54,11 +54,12 @@ def gallery():
 
 
 def readme():
+    table = gallery()   # the table first: a merge's duplicate rows are reported whatever README.md holds
     text = OUT.read_text(encoding='utf-8')
     if text.count(BEGIN) != 1 or text.count(END) != 1: sys.exit(f'README.md: the gallery markers ({BEGIN} … {END}) must appear once each')
     head, rest = text.split(BEGIN)
     if END not in rest: sys.exit('README.md: the gallery end marker must follow the begin marker')
-    return head + BEGIN + '\n' + gallery() + '\n' + END + rest.split(END, 1)[1]
+    return head + BEGIN + '\n' + table + '\n' + END + rest.split(END, 1)[1]
 
 
 if __name__ == '__main__':

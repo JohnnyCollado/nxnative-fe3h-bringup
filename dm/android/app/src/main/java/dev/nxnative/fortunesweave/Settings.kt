@@ -30,11 +30,13 @@ class Settings(private val context: Context) {
         val GPU_DRIVER = Choice("gpu_driver", "GPU driver", { c -> listOf("" to "System") + Drivers.list(c).map { it.folder.name to "${it.name} ${it.version}".trim() } }, "", live = false)
         // the frame-rate counter in the game screen's corner: the game's finished frames a second (GameActivity, dmfront.c nativeFrames); app-side only
         val FPS_COUNTER = Choice("fps", "Frame-rate counter", fixed("0" to "Off", "1" to "On"), "0", live = true)
-        // DM_FPS_TARGET: 0 the game's own frame rate (30 in gameplay, 60 in menus), 60 written into the game's target frame rate (dm/host/hle_fpslock.c, the field the rewriter
-        // finds, main's fixups FPS_TARGET_PTR). The game steps its logic by a fixed amount a frame, so 60 runs slow wherever the device cannot hold 60 fps: 30 is the default here
-        // although the profile's fps_target is 60 (the Mac's)
-        val FRAME_RATE = Choice("fps_target", "Frame rate", fixed("0" to "30 fps (game's own)", "60" to "60 fps"), "0", live = false)
-        val ALL = listOf(CONSOLE_MODE, LANGUAGE, SOUND, GPU_DRIVER, FRAME_RATE, FPS_COUNTER)
+        // DM_FPS_TARGET stays 0, the game's own frame rate (30 in gameplay, 60 in menus). The host can write 60 into the game's target (dm/host/hle_fpslock.c), but the game
+        // steps its logic by a fixed amount a frame and the device does not hold 60 in gameplay (GPU 11 to 19 ms a frame, logs_mem3/log_warm1.txt and log_blackzoom.txt), so
+        // that setting only ran the game slow: it is gone from the app (run/env.txt can still set DM_FPS_TARGET=60 for a test). 60 on screen comes from frame generation
+        // DM_LSFG: Lossless Scaling's frame generation (dm/third_party/lsfg-eden, GPL-3.0-or-later) with the user's own Lossless.dll, imported on the Settings page;
+        // one generated frame between each two real ones, so 30 fps shows as 60 (with about half a frame more delay)
+        val FRAME_GEN = Choice("lsfg", "Frame rate", fixed("0" to "30 fps (game's own)", "1" to "60 fps (frame generation)"), "0", live = false)
+        val ALL = listOf(CONSOLE_MODE, LANGUAGE, SOUND, GPU_DRIVER, FRAME_GEN, FPS_COUNTER)
         // Button mapping (FeTheme.face), app-side, live: which physical face button sends which of the game's. Nintendo: by position (right A, bottom B, top X, left Y);
         // Xbox and PlayStation: the bottom button (A / ✕) is the game's A, the right one B, the left X, the top Y. Then A/B and X/Y can be swapped. The launcher and the
         // pause menu follow it too (the button sending A picks, B goes back)
@@ -56,7 +58,7 @@ class Settings(private val context: Context) {
 
     /** The host's environment for these settings. */
     fun env(): Map<String, String> {
-        val e = mutableMapOf("DM_OPMODE" to get(CONSOLE_MODE), "DM_LANG" to get(LANGUAGE), "DM_AUDIO" to get(SOUND), "DM_FPS_TARGET" to get(FRAME_RATE))
+        val e = mutableMapOf("DM_OPMODE" to get(CONSOLE_MODE), "DM_LANG" to get(LANGUAGE), "DM_AUDIO" to get(SOUND), "DM_FPS_TARGET" to "0", "DM_LSFG" to get(FRAME_GEN))
         val drv = get(GPU_DRIVER)
         val d = if (drv.isEmpty()) null else Drivers.list(context).firstOrNull { it.folder.name == drv }
         if (d != null) { e["DM_GPU_DRIVER"] = d.library.path; e["DM_HOOK_DIR"] = context.applicationInfo.nativeLibraryDir }   // adrenotools' hooks sit beside the host

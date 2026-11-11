@@ -1,0 +1,39 @@
+#version 450
+// FSR 2's reactive mask, made from the picture itself (nvn_vk_draw.c reactive_run): where the brightness changed a lot since the last frame, at the place the game's
+// motion vector says the pixel came from, FSR 2 is told to trust its history less. Fire Emblem Fortune's Weave gives moving objects (the title screen's turning
+// gears, walking characters) a previous transform equal to the current one, so their motion vectors are zero and FSR 2 kept their old positions: ghosting
+// (the captures logs_mem3/002156 and 000778, re/tools/mvcheck.py). Brightness is blurred over 3x3 texels first, so the camera's sub-pixel jitter between frames
+// does not count as change; the previous frame's blurred brightness is kept in hist_prev and this frame's is written to hist_cur for the next.
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(set = 0, binding = 0) uniform sampler2D colour;      // the game's colour (linear, may exceed 1)
+layout(set = 0, binding = 1) uniform sampler2D motion;      // its motion vectors: previous position = this one + vector (texture coordinates)
+layout(set = 0, binding = 2) uniform sampler2D hist_prev;   // last frame's blurred brightness
+layout(set = 0, binding = 3, r8) uniform image2D reactive;           // read too: last frame's value, kept fading (decay)
+layout(set = 0, binding = 4, r16f) uniform writeonly image2D hist_cur;
+layout(push_constant) uniform P { ivec2 size; float t0, t1, rmax; int first; float decay; } p;
+
+float luma(vec3 c) { float l = max(dot(c, vec3(0.25, 0.6, 0.15)), 0.0); return l / (1.0 + l); }   // compressed: bright highlights do not dominate
+
+void main() {
+    ivec2 q = ivec2(gl_GlobalInvocationID.xy);
+    if (q.x >= p.size.x || q.y >= p.size.y) return;
+    float s = 0.0;
+    for (int dy = -1; dy <= 1; dy++)
+        for (int dx = -1; dx <= 1; dx++) s += luma(texelFetch(colour, clamp(q + ivec2(dx, dy), ivec2(0), p.size - 1), 0).rgb);
+    s /= 9.0;
+    imageStore(hist_cur, q, vec4(s));
+    float r = 0.0;
+    if (p.first == 0) {
+        vec2 uv = (vec2(q) + 0.5) / vec2(p.size) + texelFetch(motion, q, 0).rg;
+        if (all(greaterThanEqual(uv, vec2(0.0))) && all(lessThanEqual(uv, vec2(1.0)))) {
+            float prev = textureLod(hist_prev, uv, 0.0).r;
+            float d = abs(s - prev) / (max(s, prev) + 0.02);
+            r = clamp((d - p.t0) / max(p.t1 - p.t0, 1e-4), 0.0, 1.0) * p.rmax;
+        }
+        // what was marked stays marked for a while, fading: behind a moving object the picture stops changing one frame after it passed, but FSR 2's
+        // history and its locks on thin detail there still hold the object for many frames (ffx_fsr2_postprocess_lock_status.h shortens a lock only where
+        // this frame's mask is set): the trail
+        r = max(r, imageLoad(reactive, q).r * p.decay);
+    }
+    imageStore(reactive, q, vec4(r));
+}

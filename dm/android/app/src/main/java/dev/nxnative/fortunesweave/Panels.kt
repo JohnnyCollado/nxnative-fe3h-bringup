@@ -39,6 +39,9 @@ class FocusBox(context: Context) : FrameLayout(context) {
 class MenuNav(private val context: Context, private val settings: Settings, private val right: FocusBox, private val placeholder: View, private val hint: TextView, private val leftHint: String) {
     private var button: View? = null
     private var panel: View? = null
+    /** The launcher: B closes the open section (the right side goes back to its empty state, its button is no longer marked) and focus returns to that button.
+     *  Off (the pause menu): B only moves focus from the panel back to its button, and the panel stays. */
+    var backCloses = false
 
     init { clear() }
 
@@ -66,6 +69,7 @@ class MenuNav(private val context: Context, private val settings: Settings, priv
     fun back(): Boolean {
         val p = panel ?: return false
         if (p is Editable && p.editing) { p.stopEdit(); update(); return true }
+        if (backCloses) { val b = button; clear(); b?.requestFocus(); update(); return true }   // from the panel or from the left list with a section open
         if (p.hasFocus()) { button?.requestFocus(); update(); return true }
         return false
     }
@@ -100,7 +104,7 @@ class MenuNav(private val context: Context, private val settings: Settings, priv
         fun placeholder(c: Context, t: String) = LinearLayout(c).apply {
             orientation = LinearLayout.VERTICAL; gravity = Gravity.CENTER
             FeTheme.art(c, "fe_crest")?.let { addView(ImageView(c).apply { setImageDrawable(it); alpha = 0.16f }, LinearLayout.LayoutParams(FeTheme.dp(c, 110), FeTheme.dp(c, 140))) }
-            addView(TextView(c).apply { text = t; textSize = 16f; typeface = FeTheme.SERIF; setTextColor(Color.rgb(0x6d, 0x63, 0x90)); gravity = Gravity.CENTER; setPadding(0, FeTheme.dp(c, 10), 0, 0) })
+            addView(TextView(c).apply { text = t; textSize = 16f; typeface = FeTheme.SERIF; setTextColor(FeTheme.MUTED); gravity = Gravity.CENTER; setPadding(0, FeTheme.dp(c, 10), 0, 0) })
         }
     }
 }
@@ -171,7 +175,7 @@ class DriversPanel(context: Context, private val settings: Settings, private val
                 addView(TextView(context).apply { text = d?.name ?: "System driver"; textSize = 16f; typeface = FeTheme.SERIF; setTextColor(FeTheme.INK); maxLines = 1; ellipsize = android.text.TextUtils.TruncateAt.END })
                 addView(TextView(context).apply { text = d?.version ?: ""; textSize = 13f; typeface = FeTheme.SERIF; setTextColor(FeTheme.INK_SOFT); setPadding(dp(8), 0, 0, 0); maxLines = 1 },
                     LayoutParams(0, LayoutParams.WRAP_CONTENT, 1f))
-                if (inUse) addView(TextView(context).apply { text = "in use"; textSize = 13f; typeface = FeTheme.SERIF; setTextColor(Color.rgb(0x7a, 0x63, 0xc6)) })
+                if (inUse) addView(TextView(context).apply { text = "in use"; textSize = 13f; typeface = FeTheme.SERIF; setTextColor(FeTheme.GOLD) })
             }, LayoutParams(0, dp(52), 1f))
             val use = FeTheme.iconButton(context, R.drawable.fe_ic_check, if (inUse) FeTheme.GOLD else FeTheme.LIGHT).apply {
                 contentDescription = "Use ${d?.name ?: "the system driver"}"

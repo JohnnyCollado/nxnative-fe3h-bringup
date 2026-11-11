@@ -13,6 +13,9 @@
 #include "nvn_obj.h"         // the command records hle_nvn.c writes (op_hdr, OP_*, p_clear_buf, sync_t)
 #include "nvn_timestamp.h"   // GPU counter ticks from nanoseconds
 #include "nvn_vk.h"
+// frame statistics kept by the Vulkan backend (nvn_vk_exec.c)
+void vkx_create_stats(uint64_t *mods, uint64_t *pipes, uint64_t *mods_ns, uint64_t *pipes_ns); void vkx_upload_stats(uint64_t *first, uint64_t *again, uint64_t *bytes);
+uint64_t vkx_upload_ns_take(void); double vkx_gpu_ms(uint64_t f); void vkx_set_frame(uint64_t f);
 
 static _Atomic uint64_t g_fence;
 uint64_t guest_ns(void);   // hle_os.c: the guest clock, which counter timestamps use (as nvn_mtl.m gpu_ticks)
@@ -68,6 +71,7 @@ void mtl_exec_rest(const uint64_t *handles, int n) { (void)handles; (void)n; }  
 void mtl_queue_activate(uint64_t serial) { (void)serial; }
 void mtl_queue_forget(uint64_t serial) { (void)serial; }
 void mtl_set_frame(uint64_t f) {
+    vkx_set_frame(f);
     nvn_null_opstat_frame(f);
     if (f % 600 == 0 && f) { int n, bad; uint64_t b; vk_pool_stats(&n, &b, &bad); flockfile(stderr); fprintf(stderr, "[dm] [vk] frame %llu: %d pools on the GPU, %.1f MB, %d left in ordinary memory\n", (unsigned long long)f, n, b / 1048576.0, bad); funlockfile(stderr); }
 }
@@ -109,14 +113,14 @@ void mtl_alloc_stats(uint64_t *a, uint64_t *b, int *c) { Z(a); Z(b); Z(c); }
 void mtl_args_stats(uint64_t *a, uint64_t *b) { Z(a); Z(b); }
 void mtl_barrier_stats(uint64_t *a, uint64_t *b) { Z(a); Z(b); }
 void mtl_bw(uint64_t *a, uint64_t *b, uint64_t *c) { Z(a); Z(b); Z(c); }
-void mtl_create_ns(uint64_t *a, uint64_t *b) { Z(a); Z(b); }
-void mtl_create_stats(uint64_t *a, uint64_t *b) { Z(a); Z(b); }
+void mtl_create_ns(uint64_t *a, uint64_t *b) { vkx_create_stats(NULL, NULL, a, b); }   // shader loads (the Metal side's libraries) and pipeline creates, from nvn_vk_exec.c
+void mtl_create_stats(uint64_t *a, uint64_t *b) { vkx_create_stats(a, b, NULL, NULL); }
 void mtl_cshoist_stats(uint64_t *a, uint64_t *b, uint64_t *c) { Z(a); Z(b); Z(c); }
 void mtl_geohoist_stats(uint64_t *a, uint64_t *b, uint64_t *c) { Z(a); Z(b); Z(c); }
 void mtl_geomesh_stats(uint64_t *a, uint64_t *b) { Z(a); Z(b); }
 void mtl_hybrid_stats(uint64_t *a, uint64_t *b, uint64_t *c) { Z(a); Z(b); Z(c); }
 void mtl_lc_stats(uint64_t *a, uint64_t *b) { Z(a); Z(b); }
-void mtl_pkg_stats(uint64_t *a, uint64_t *b) { Z(a); Z(b); }
+void mtl_pkg_stats(uint64_t *a, uint64_t *b) { vkx_upload_stats(a, b, NULL); }   // texture first uploads and re-uploads
 void mtl_sm_stats(uint64_t *a, uint64_t *b, uint64_t *c) { Z(a); Z(b); Z(c); }
 void mtl_ubd_stats(uint64_t *a, uint64_t *b) { Z(a); Z(b); }
 void mtl_ubp_stats(uint64_t *a, uint64_t *b, uint64_t *c) { Z(a); Z(b); Z(c); }
@@ -126,7 +130,7 @@ void mtl_vbuf_stats(uint64_t *a, uint64_t *b, uint64_t *c, uint64_t *d, uint64_t
 void mtl_res_stats(char *out, size_t n) { if (n) out[0] = 0; }
 void mtl_mem_stat(unsigned long long frame, unsigned long long mb) { (void)frame; (void)mb; }
 void mtl_ab_gpu(uint64_t f, double gpu_ms, double frame_ms) { (void)f; (void)gpu_ms; (void)frame_ms; }
-double mtl_gpu_ms(uint64_t f) { (void)f; return 0; }
+double mtl_gpu_ms(uint64_t f) { return vkx_gpu_ms(f); }   // GPU time of frame f from its submissions' timestamps, -1 until known
 int mtl_gpu_span(uint64_t f, uint64_t *t0, uint64_t *t1) { (void)f; Z(t0); Z(t1); return 0; }
 unsigned mtl_cpu_tex_count(void) { return 0; }
 uint64_t mtl_cut_count(void) { return 0; }
@@ -137,9 +141,9 @@ uint64_t mtl_ds_omit(void) { return 0; }
 uint64_t mtl_pkg_edge_skips(void) { return 0; }
 uint64_t mtl_pkg_miss(void) { return 0; }
 uint64_t mtl_udc_saved_bytes(void) { return 0; }
-uint64_t mtl_upload_bytes(void) { return 0; }
+uint64_t mtl_upload_bytes(void) { uint64_t b; vkx_upload_stats(NULL, NULL, &b); return b; }
 uint64_t mtl_upload_gpu_ns_take(void) { return 0; }
-uint64_t mtl_upload_ns_take(void) { return 0; }
+uint64_t mtl_upload_ns_take(void) { return vkx_upload_ns_take(); }
 
 // ---- GPU diagnostics (texture and pass dumps, frame capture): unavailable without a GPU backend ----
 void dm_gfx_passdump_next(long n) { (void)n; }

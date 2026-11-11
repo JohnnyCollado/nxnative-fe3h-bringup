@@ -115,10 +115,59 @@ static uint64_t now_ns_mono(void) { struct timespec t; clock_gettime(CLOCK_MONOT
 // ---------- Slow-submit breakdown (DM_VK_SLOW_SUB, ms; default 60): a submission that took longer than the threshold reports wall vs this thread's CPU ----------
 // wall >> CPU: the submit thread was descheduled (the game's loading threads); wall ~ CPU: the driver calls themselves. Phases: slot wait, record, commit;
 // and inside record: texture creates (1), descriptor writes (2), pipeline creates (3), the usual suspects at an area transition
-static uint64_t g_sb_t0, g_sb_cpu0, g_sb_slot, g_sb_rec, g_sb_commit, g_sb_ns[4]; static unsigned g_sb_n[4];
+static uint64_t g_sb_t0, g_sb_cpu0, g_sb_slot, g_sb_rec, g_sb_commit, g_sb_ns[5]; static unsigned g_sb_n[5];
 static uint64_t cpu_ns(void) { struct timespec t; clock_gettime(CLOCK_THREAD_CPUTIME_ID, &t); return (uint64_t)t.tv_sec * 1000000000ull + (uint64_t)t.tv_nsec; }
 uint64_t vkx_now_ns(void) { return now_ns_mono(); }
-void vkx_sb_note(int what, uint64_t ns) { if (what > 0 && what < 4) { g_sb_ns[what] += ns; g_sb_n[what]++; } }
+// what: 1 texture create, 2 descriptor writes, 3 pipeline create, 4 shader module create. Also kept as running totals for hle_nvn.c's frame statistics (vkx_create_stats)
+static _Atomic uint64_t g_cr_n[5], g_cr_ns[5];
+void vkx_sb_note(int what, uint64_t ns) { if (what > 0 && what < 5) { g_sb_ns[what] += ns; g_sb_n[what]++; g_cr_n[what]++; g_cr_ns[what] += ns; } }
+void vkx_create_stats(uint64_t *mods, uint64_t *pipes, uint64_t *mods_ns, uint64_t *pipes_ns) {
+    if (mods) *mods = g_cr_n[4]; if (pipes) *pipes = g_cr_n[3]; if (mods_ns) *mods_ns = g_cr_ns[4]; if (pipes_ns) *pipes_ns = g_cr_ns[3];
+}
+// ---------- GPU time per frame (mtl_gpu_ms: hle_nvn.c's timing line and slow-frame log) ----------
+// Each submission writes a timestamp when the GPU starts it and one when it ends; the completion thread adds the difference to the frame it was recorded in. A frame
+// counts once all its submissions are done (pending 0), as nvn_mtl.m's gpu_tag_begin / gpu_tag_done do with Metal's command buffer times. Time between submissions
+// (the GPU idle, waiting for the next one) is not counted. Off when the queue has no timestamps (timestampValidBits 0)
+enum { GRING = 64 };
+static struct { _Atomic uint64_t frame, ns; _Atomic int pending; } g_gpuf[GRING];
+static VkQueryPool g_ts_pool; static int g_ts_on = -1; static uint64_t g_ts_mask; static _Atomic uint64_t g_vk_frame;
+void vkx_set_frame(uint64_t f) { atomic_store(&g_vk_frame, f); }
+uint64_t vkx_frame(void) { return atomic_load(&g_vk_frame); }
+void vkx_sb_time(int what, uint64_t ns) { if (what > 0 && what < 5) { g_sb_ns[what] += ns; g_cr_ns[what] += ns; } }   // time only, no new item (a wait for a pipeline a worker builds)
+static int ts_on(void) {
+    if (g_ts_on >= 0) return g_ts_on;
+    g_ts_on = 0;
+    uint32_t n = 0; vkGetPhysicalDeviceQueueFamilyProperties(g_vk.pd, &n, NULL);
+    VkQueueFamilyProperties *qf = calloc(n ? n : 1, sizeof *qf); vkGetPhysicalDeviceQueueFamilyProperties(g_vk.pd, &n, qf);
+    uint32_t bits = g_vk.qfam < n ? qf[g_vk.qfam].timestampValidBits : 0; free(qf);
+    if (!bits || g_vk.lim.timestampPeriod <= 0) { VLOG("GPU time per frame: off (the queue has no timestamps)"); return 0; }
+    g_ts_mask = bits >= 64 ? ~0ull : (1ull << bits) - 1;
+    VkQueryPoolCreateInfo qi = {VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO, NULL, 0, VK_QUERY_TYPE_TIMESTAMP, 2 * NSUB, 0};
+    if (vkCreateQueryPool(g_vk.dev, &qi, NULL, &g_ts_pool)) { VLOG("[RED] GPU time per frame: no query pool"); return 0; }
+    return g_ts_on = 1;
+}
+static void gpu_tag_begin(uint64_t f) {
+    unsigned k = f % GRING;
+    if (atomic_load(&g_gpuf[k].frame) != f) { atomic_store(&g_gpuf[k].frame, f); atomic_store(&g_gpuf[k].ns, 0); atomic_store(&g_gpuf[k].pending, 0); }
+    atomic_fetch_add(&g_gpuf[k].pending, 1);
+}
+static void gpu_tag_done(sub_t *s) {   // completion thread: the submission's two timestamps, read once it has completed
+    if (!s->ts) return;
+    s->ts = 0; unsigned k = s->frame % GRING; uint32_t q = (uint32_t)(s - g_sub) * 2; uint64_t t[2] = {0, 0};
+    VkResult r = vkGetQueryPoolResults(g_vk.dev, g_ts_pool, q, 2, sizeof t, t, sizeof t[0], VK_QUERY_RESULT_64_BIT);
+    if (atomic_load(&g_gpuf[k].frame) != s->frame) return;
+    if (r == VK_SUCCESS) atomic_fetch_add(&g_gpuf[k].ns, (uint64_t)((double)((t[1] - t[0]) & g_ts_mask) * (double)g_vk.lim.timestampPeriod));
+    atomic_fetch_sub(&g_gpuf[k].pending, 1);
+}
+double vkx_gpu_ms(uint64_t f) {
+    unsigned k = f % GRING;
+    if (g_ts_on != 1 || atomic_load(&g_gpuf[k].frame) != f || atomic_load(&g_gpuf[k].pending)) return -1;
+    return atomic_load(&g_gpuf[k].ns) / 1e6;
+}
+// texture uploads (the slow-frame log): first uploads, re-uploads of a texture the CPU wrote again, bytes, and the CPU time of recording them
+static _Atomic uint64_t g_up_first, g_up_again, g_up_bytes, g_up_ns;
+void vkx_upload_stats(uint64_t *first, uint64_t *again, uint64_t *bytes) { if (first) *first = g_up_first; if (again) *again = g_up_again; if (bytes) *bytes = g_up_bytes; }
+uint64_t vkx_upload_ns_take(void) { return atomic_exchange(&g_up_ns, 0); }
 static void *completion_thread(void *unused) {
     (void)unused;
     for (;;) {
@@ -135,6 +184,7 @@ static void *completion_thread(void *unused) {
             usleep(100000); continue; }
         if (r) { VRED_ONCE("vkWaitSemaphores failed (%d)", r); usleep(1000); continue; }
         { uint64_t d = now_ns_mono(), st = g_sub[want % NSUB].submit_ns; if (st < g_last_done_ns) st = g_last_done_ns; if (st && d > st) g_t_gpu += d - st; g_last_done_ns = d; }
+        gpu_tag_done(&g_sub[want % NSUB]);
         apply_posts(&g_sub[want % NSUB]);
         pthread_mutex_lock(&g_done_mu); atomic_store(&g_applied, want); pthread_cond_broadcast(&g_done_cv); pthread_mutex_unlock(&g_done_mu);
         grave_collect(want);
@@ -204,6 +254,12 @@ void mtl_sub_begin(void) {
     VkCommandBufferBeginInfo bi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, NULL, VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT};
     vkBeginCommandBuffer(s->cb, &bi);
     barrier_all(s->cb);   // the CPU's writes to pool memory before this submission (coherent memory: a host-to-device barrier is all it needs)
+    s->ts = 0;
+    if (ts_on()) {   // GPU time per frame: the start timestamp (the end one is written at commit)
+        uint32_t q = (uint32_t)(s - g_sub) * 2; s->frame = atomic_load(&g_vk_frame);
+        vkCmdResetQueryPool(s->cb, g_ts_pool, q, 2); vkCmdWriteTimestamp(s->cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, g_ts_pool, q);
+        gpu_tag_begin(s->frame); s->ts = 1;
+    }
     s->open = 1; g_cur = s;
 }
 static int wait_applied(uint64_t fence, uint64_t timeout_ns);
@@ -213,6 +269,7 @@ uint64_t mtl_sub_commit(void) {
     sub_t *s = g_cur;
     uint64_t c0 = now_ns_mono();
     end_rendering();
+    if (s->ts) vkCmdWriteTimestamp(s->cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, g_ts_pool, (uint32_t)(s - g_sub) * 2 + 1);
     vkEndCommandBuffer(s->cb);
     s->value = __atomic_add_fetch(&g_fence, 1, __ATOMIC_RELEASE); s->open = 0; g_cur = NULL; vkd_sub_committed(s->value);
     VkTimelineSemaphoreSubmitInfo ts = {VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO, NULL, 0, NULL, 1, &s->value};
@@ -452,7 +509,14 @@ static VkBuffer stage_buffer(sub_t *s, uint64_t size, void **map) {
 }
 uint32_t level_dim(uint32_t v, unsigned level) { v >>= level; return v ? v : 1; }
 // Upload a texture's storage into its image when the GPU is about to read it and its current content is the CPU's
-static void tex_upload(vk_tex *x, sub_t *s) {
+static void tex_upload_do(vk_tex *x, sub_t *s);
+static void tex_upload(vk_tex *x, sub_t *s) {   // counted for the slow-frame log (vkx_upload_stats)
+    if (x->gpu_owned || !x->dirty || !x->mem) return;
+    uint64_t t0 = now_ns_mono(), n0 = x->up_n;
+    tex_upload_do(x, s);
+    if (x->up_n != n0) { if (n0) g_up_again++; else g_up_first++; g_up_bytes += x->linear ? x->L.size : x->dbytes; g_up_ns += now_ns_mono() - t0; }
+}
+static void tex_upload_do(vk_tex *x, sub_t *s) {
     if (x->gpu_owned || !x->dirty || !x->mem) return;
     if (x->d.samples > 1) { x->dirty = 0; return; }
     if (stages_on()) {   // DM_VK_RING_STAGES: an upload in the frame, and whether an image the GPU drew holds the same guest memory (its content is not what is uploaded)
@@ -685,7 +749,7 @@ static void prof_frame(uint64_t n) {
 // with depth writes on whose compare runs the other way from the pass's own draws. The driver keeps the copy for one direction, and drops it for the image when the
 // direction turns, until a pass clears the image again. NEVER, or the same draw with depth writes off, does not do it; a fragment shader that discards everything does
 // not prevent it. So every pass with a depth attachment begins with two draws of one pixel that discard every fragment, depth writes on: LESS, then GREATER (one of them
-// is the other way, whichever way the pass draws; lrztest methods f and g: no frame with holes in 300, with shadow passes, copies, samples and four frames in flight
+// is the other way, whichever way the pass draws; each at the depth that cannot pass its own compare, since the driver wrote the depth of a draw that could, discard or not; lrztest methods f and g: no frame with holes in 300, with shadow passes, copies, samples and four frames in flight
 // too). Nothing is written. The cost is the early rejection itself: the driver falls back to the per-pixel depth test.
 #include "nvn_vk_lrz_spv.h"
 static int lrz_kick_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_VK_LRZ_KICK"); v = !(e && e[0] == '0'); VLOG("depth passes %s", v ? "begin with the early-depth kick (two one-pixel draws that turn the compare direction)" : "do not get the early-depth kick (DM_VK_LRZ_KICK=0)"); } return v; }
@@ -723,8 +787,8 @@ static void lrz_kick(VkCommandBuffer cb, uint32_t n, const VkFormat *cf, VkForma
     lrz_pipe *e = lrz_pipe_of(n, cf, df, asp, samples); if (!e) { g_n_lrz_skip++; return; }
     VkViewport v = {0, 0, (float)w, (float)h, 0, 1}; VkRect2D sc = {{0, 0}, {1, 1}};
     vkCmdSetViewport(cb, 0, 1, &v); vkCmdSetScissor(cb, 0, 1, &sc);
-    vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, e->p[0]); vkCmdDraw(cb, 3, 1, 0, 0);
-    vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, e->p[1]); vkCmdDraw(cb, 3, 1, 0, 0);
+    vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, e->p[0]); vkCmdDraw(cb, 3, 1, 0, 1);   // LESS at depth 1 (the first instance is the depth, shaders/lrz.vert): cannot pass
+    vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, e->p[1]); vkCmdDraw(cb, 3, 1, 0, 0);   // GREATER at depth 0: cannot pass
     g_n_lrz_kick++;
 }
 static void wait_land_kick(VkCommandBuffer cb, vk_tex *x) { VkFormat none[8]; memset(none, 0, sizeof none); uint32_t sm = x->d.samples >= 8 ? 8 : x->d.samples >= 4 ? 4 : x->d.samples >= 2 ? 2 : 1; lrz_kick(cb, 0, none, x->fmt, x->aspect, sm, level_dim(x->w, x->wl), level_dim(x->h, x->wl)); }
@@ -1123,9 +1187,10 @@ static float f10(uint32_t v) { uint32_t e = v >> 5 & 31, m = v & 31; return e ? 
 // has already happened when the trigger comes (Fire Emblem Fortune's Weave's broken floor lasts 2 frames at a hit, too short to start a capture for). About 5 MB a frame
 #define STG_MAX 112
 typedef struct { VkBuffer cb, db; VkDeviceMemory cm, dm; uint8_t *cmap, *dmap; uint32_t w, h, dbpp; uint64_t frame; int valid; char *notes; size_t nn;
-                 VkBuffer sb; VkDeviceMemory sm; uint8_t *smap; int sn, sfill; char lab[STG_MAX][96];                // sb..lab: the stage snapshots (DM_VK_RING_STAGES)
+                 VkBuffer sb; VkDeviceMemory sm; uint8_t *smap; int sn, sfill; char lab[STG_MAX][96]; VkBuffer hb; uint8_t *hmap; uint8_t hset[STG_MAX];                // sb..lab: the stage snapshots (DM_VK_RING_STAGES)
                  VkBuffer xb; VkDeviceMemory xm; uint8_t *xmap; uint64_t xn; int xfill, xd; char *xidx; size_t xin;
-                 VkQueryPool op; VkBuffer ob; VkDeviceMemory om; uint8_t *omap; int on, ofill, osaved; } ring_slot;   // op..osaved: per-draw pixel counts (DM_VK_RING_OCC)
+                 VkQueryPool op; VkBuffer ob; VkDeviceMemory om; uint8_t *omap; int on, ofill, osaved;
+                 VkBuffer lb; VkDeviceMemory lm; uint8_t *lmap; uint64_t lcap; int lfill; char lnote[512]; uint32_t lw, lh; } ring_slot;   // lb..lh: DLSS inputs (DM_VK_RING_DLSS)   // op..osaved: per-draw pixel counts (DM_VK_RING_OCC)
 //   // xb..xin: compute buffer dumps (DM_VK_RING_CS)
 static ring_slot *g_ring; static int g_ring_n = -1, g_ring_i; static char *g_ring_cur; static size_t g_ring_cn, g_ring_cc;
 static VkImage g_ring_img; static VkDeviceMemory g_ring_imem; static uint32_t g_ring_iw, g_ring_ih;
@@ -1161,6 +1226,41 @@ int vkx_occ_begin(VkCommandBuffer cb) {
     int q = r->on++; g_occ_pool = r->op; vkCmdBeginQuery(cb, r->op, (uint32_t)q, VK_QUERY_CONTROL_PRECISE_BIT); return q;
 }
 void vkx_occ_end(VkCommandBuffer cb, int q) { if (q >= 0) vkCmdEndQuery(cb, g_occ_pool, (uint32_t)q); }
+// ---------- DM_VK_RING_DLSS=1 (with DM_VK_RING): the upscaler's inputs, raw ----------
+// At the frame's DLSS call, its colour, motion vectors and depth (4 bytes a texel each: B10G11R11 / R16G16 float / D32 float in Fire Emblem Fortune's Weave) are copied
+// as they are into the frame's slot and saved as f<frame>_dlss.bin (colour, then motion, then depth) with f<frame>_dlss.txt (sizes, formats, jitter, motion scale).
+// The stage snapshots blit to 8 bits and lose small motion; these keep the values FSR 2 reads, to tell trails on objects with no motion from a wrong sign or scale
+void vkx_ring_dlss(sub_t *s, vk_tex *col, vk_tex *mot, vk_tex *dep, const float jit[2], const float mv[2]) {
+    static int on = -1; if (on < 0) { const char *e = getenv("DM_VK_RING_DLSS"); on = ring_on() && e && e[0] == '1'; if (on) VLOG("DM_VK_RING_DLSS: the upscaler's colour, motion vectors and depth kept with the ring"); }
+    if (!on || !s || !col || !mot || !dep) return;
+    if (mot->w != col->w || mot->h != col->h || dep->w != col->w || dep->h != col->h) { VRED_ONCE("DM_VK_RING_DLSS: the inputs differ in size: not kept"); return; }
+    ring_slot *r = &g_ring[g_ring_i % g_ring_n];
+    uint64_t one = (uint64_t)col->w * col->h * 4, need = one * 3 + (uint64_t)col->w * col->h;   // and the reactive mask, a byte a texel (vkx_ring_mask)
+    if (r->lb && r->lcap < need) { vkDestroyBuffer(g_vk.dev, r->lb, NULL); vkFreeMemory(g_vk.dev, r->lm, NULL); r->lb = VK_NULL_HANDLE; }
+    if (!r->lb) { void *m = NULL; r->lb = stage_buffer(NULL, need, &m); r->lm = g_last_stage_mem; r->lmap = m; r->lcap = need; if (!r->lb) return; }
+    end_rendering(); barrier_all(s->cb);
+    vk_tex *t[3] = {col, mot, dep};
+    for (int k = 0; k < 3; k++) {
+        VkImageAspectFlags a = (t[k]->aspect & VK_IMAGE_ASPECT_DEPTH_BIT) ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT;
+        VkBufferImageCopy c = {one * (uint64_t)k, 0, 0, {a, 0, 0, 1}, {0, 0, 0}, {col->w, col->h, 1}};
+        vkCmdCopyImageToBuffer(s->cb, t[k]->img, VK_IMAGE_LAYOUT_GENERAL, r->lb, 1, &c);
+    }
+    barrier_all(s->cb);
+    r->lfill = g_ring_i + 1; r->lw = col->w; r->lh = col->h;
+    snprintf(r->lnote, sizeof r->lnote, "size %ux%u colour fmt %d motion fmt %d depth fmt %d jitter %.4f %.4f motion scale %.3f %.3f\n"
+             "textures colour %llu motion %llu at %p (drawn by the GPU %d) depth %llu\n", col->w, col->h, col->fmt, mot->fmt, dep->fmt, jit[0], jit[1], mv[0], mv[1],
+             (unsigned long long)col->serial, (unsigned long long)mot->serial, (void *)mot->mem, mot->gpu_owned, (unsigned long long)dep->serial);
+}
+// the reactive mask made for this frame's DLSS call (nvn_vk_draw.c reactive_run), after the three inputs in f<frame>_dlss.bin
+void vkx_ring_mask(sub_t *s, VkImage img, uint32_t w, uint32_t h) {
+    if (!ring_on() || !s || !img) return;
+    ring_slot *r = &g_ring[g_ring_i % g_ring_n];
+    if (!r->lb || r->lfill != g_ring_i + 1 || r->lw != w || r->lh != h) return;   // this frame's inputs are kept (DM_VK_RING_DLSS)
+    barrier_all(s->cb);
+    VkBufferImageCopy c = {(uint64_t)w * h * 12, 0, 0, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, 0, 0}, {w, h, 1}};
+    vkCmdCopyImageToBuffer(s->cb, img, VK_IMAGE_LAYOUT_GENERAL, r->lb, 1, &c);
+    barrier_all(s->cb);
+}
 static uint32_t depth_bpp(VkFormat f) { return f == VK_FORMAT_D16_UNORM ? 2 : 4; }
 // ---------- DM_VK_RING_CS=<key>[,<key>...] (with DM_VK_RING): the buffers of those compute shaders' dispatches ----------
 // After each dispatch of a named shader, every uniform and storage buffer bound to the compute stage is copied (its first CSD_PART bytes) into the frame's slot, with an
@@ -1199,8 +1299,11 @@ void vkx_ring_csdump2(sub_t *s, const char *want, uint64_t key, int x, int y, in
 // snapshot that differs is the step that broke. Texture uploads are noted too ("UPLOAD"), with any GPU-written image over the same guest memory
 static int g_stg = -1; static const uint32_t g_stg_w = 160, g_stg_h = 90;
 static VkImage g_stg_img; static VkDeviceMemory g_stg_imem; static uint64_t g_stg_n, g_stg_skip;
+static int g_stg_hdr; static VkImage g_stg_img16; static VkDeviceMemory g_stg_imem16;   // DM_VK_RING_STAGES=2: each colour snapshot also as 16-bit float (f<frame>_s<nn>.f16, 160x90 RGBA half floats), since the 8-bit
+                                                                                         // one clips everything above 1 and a lit scene before tone mapping is all above 1 (the world map's dark triangle, logs_mem3/001253)
+
 static int stages_on(void) {
-    if (g_stg < 0) { const char *e = getenv("DM_VK_RING_STAGES"); g_stg = ring_on() && e && e[0] == '1'; if (g_stg) VLOG("DM_VK_RING_STAGES: %d snapshots of %ux%u a frame at most, kept with the ring", STG_MAX, g_stg_w, g_stg_h); }
+    if (g_stg < 0) { const char *e = getenv("DM_VK_RING_STAGES"); g_stg = ring_on() && e && (e[0] == '1' || e[0] == '2'); g_stg_hdr = g_stg && e[0] == '2'; if (g_stg) VLOG("DM_VK_RING_STAGES: %d snapshots of %ux%u a frame at most, kept with the ring", STG_MAX, g_stg_w, g_stg_h); }
     return g_stg;
 }
 // one snapshot of x into the slot the current frame fills; outside a render pass (callers: end_rendering, after a dispatch)
@@ -1209,6 +1312,7 @@ void vkx_stage_snap(sub_t *s, vk_tex *x, const char *what) {
     ring_slot *r = &g_ring[g_ring_i % g_ring_n];
     if (r->sfill != g_ring_i + 1) { r->sfill = g_ring_i + 1; r->sn = 0; }
     if (r->sn >= STG_MAX) { g_stg_skip++; return; }
+    r->hset[r->sn] = 0;
     if (!blit_ok(x->fmt, VK_FORMAT_R8G8B8A8_UNORM, 1)) { vkx_ring_note("STAGE - %s tex %llu fmt %d: no blit", what, (unsigned long long)x->serial, x->fmt); return; }
     if (!r->sb) { void *m = NULL; r->sb = stage_buffer(NULL, (uint64_t)STG_MAX * g_stg_w * g_stg_h * 4, &m); r->sm = g_last_stage_mem; r->smap = m; if (!r->sb) return; }
     VkCommandBuffer cb = s->cb;
@@ -1230,6 +1334,27 @@ void vkx_stage_snap(sub_t *s, vk_tex *x, const char *what) {
     VkBufferImageCopy c = {(VkDeviceSize)r->sn * g_stg_w * g_stg_h * 4, 0, 0, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, 0, 0}, {g_stg_w, g_stg_h, 1}};
     vkCmdCopyImageToBuffer(cb, g_stg_img, VK_IMAGE_LAYOUT_GENERAL, r->sb, 1, &c);
     barrier_all(cb);
+    if (g_stg_hdr && blit_ok(x->fmt, VK_FORMAT_R16G16B16A16_SFLOAT, 1)) {
+        if (!r->hb) { void *m = NULL; r->hb = stage_buffer(NULL, (uint64_t)STG_MAX * g_stg_w * g_stg_h * 8, &m); r->hmap = m; }
+        if (r->hb && !g_stg_img16) {
+            VkImageCreateInfo ii = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, NULL, 0, VK_IMAGE_TYPE_2D, VK_FORMAT_R16G16B16A16_SFLOAT, {g_stg_w, g_stg_h, 1}, 1, 1, VK_SAMPLE_COUNT_1_BIT, VK_IMAGE_TILING_OPTIMAL,
+                                    VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT, VK_SHARING_MODE_EXCLUSIVE, 0, NULL, VK_IMAGE_LAYOUT_UNDEFINED};
+            VkMemoryRequirements mr; VkMemoryAllocateInfo mai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, NULL, 0, 0};
+            if (vkCreateImage(g_vk.dev, &ii, NULL, &g_stg_img16)) g_stg_img16 = VK_NULL_HANDLE;
+            else { vkGetImageMemoryRequirements(g_vk.dev, g_stg_img16, &mr); mai.allocationSize = mr.size; mai.memoryTypeIndex = device_local_type(mr.memoryTypeBits);
+                   if (vkAllocateMemory(g_vk.dev, &mai, NULL, &g_stg_imem16) || vkBindImageMemory(g_vk.dev, g_stg_img16, g_stg_imem16, 0)) { vkDestroyImage(g_vk.dev, g_stg_img16, NULL); g_stg_img16 = VK_NULL_HANDLE; } }
+            if (g_stg_img16) { VkImageMemoryBarrier ib = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, NULL, 0, VK_ACCESS_TRANSFER_WRITE_BIT, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
+                                                          VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, g_stg_img16, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}};
+                               vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1, &ib); }
+        }
+        if (r->hb && g_stg_img16) {
+            vkCmdBlitImage(cb, x->img, VK_IMAGE_LAYOUT_GENERAL, g_stg_img16, VK_IMAGE_LAYOUT_GENERAL, 1, &bl, VK_FILTER_LINEAR);
+            barrier_all(cb);
+            VkBufferImageCopy c16 = {(VkDeviceSize)r->sn * g_stg_w * g_stg_h * 8, 0, 0, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, 0, 0}, {g_stg_w, g_stg_h, 1}};
+            vkCmdCopyImageToBuffer(cb, g_stg_img16, VK_IMAGE_LAYOUT_GENERAL, r->hb, 1, &c16);
+            barrier_all(cb); r->hset[r->sn] = 1;
+        }
+    }
     snprintf(r->lab[r->sn], sizeof r->lab[r->sn], "%s tex %llu %ux%u fmt %d at %#llx", what, (unsigned long long)x->serial, x->w, x->h, x->fmt, (unsigned long long)(uintptr_t)x->mem);
     vkx_ring_note("STAGE %d %s", r->sn, r->lab[r->sn]);
     r->sn++; g_stg_n++;
@@ -1244,6 +1369,7 @@ void vkx_stage_snap_depth(sub_t *s, vk_tex *x, const char *what) {
     ring_slot *r = &g_ring[g_ring_i % g_ring_n];
     if (r->sfill != g_ring_i + 1) { r->sfill = g_ring_i + 1; r->sn = 0; }
     if (r->sn >= STG_MAX) { g_stg_skip++; return; }
+    r->hset[r->sn] = 0;
     if (!blit_ok(VK_FORMAT_R32_SFLOAT, VK_FORMAT_R8G8B8A8_UNORM, 0)) { vkx_ring_note("STAGE - depth: no R32F blit"); return; }
     if (!r->sb) { void *m = NULL; r->sb = stage_buffer(NULL, (uint64_t)STG_MAX * g_stg_w * g_stg_h * 4, &m); r->sm = g_last_stage_mem; r->smap = m; if (!r->sb) return; }
     VkCommandBuffer cb = s->cb;
@@ -1363,6 +1489,10 @@ static void ring_save_check(uint64_t n) {
         }
         free(rgba);
         if (r->notes) { snprintf(p, sizeof p, "%s/f%06llu_draws.txt", dir, (unsigned long long)r->frame); FILE *f = fopen(p, "w"); if (f) { fwrite(r->notes, 1, r->nn, f); fclose(f); } }
+        if (r->lmap && r->lfill && r->lfill <= g_ring_i && r->lfill > g_ring_i - g_ring_n) {   // the upscaler's inputs (DM_VK_RING_DLSS)
+            snprintf(p, sizeof p, "%s/f%06llu_dlss.txt", dir, (unsigned long long)r->frame); FILE *f = fopen(p, "w"); if (f) { fputs(r->lnote, f); fclose(f); }
+            snprintf(p, sizeof p, "%s/f%06llu_dlss.bin", dir, (unsigned long long)r->frame); f = fopen(p, "wb"); if (f) { fwrite(r->lmap, 1, (size_t)r->lw * r->lh * 13, f); fclose(f); }
+        }
         if (r->omap && r->osaved > 0) {   // the per-draw pixel counts (DM_VK_RING_OCC)
             snprintf(p, sizeof p, "%s/f%06llu_occ.txt", dir, (unsigned long long)r->frame); FILE *f = fopen(p, "w");
             if (f) { for (int q = 0; q < r->osaved; q++) { uint64_t v; memcpy(&v, r->omap + (size_t)q * 8, 8); fprintf(f, "%d %llu\n", q, (unsigned long long)v); } fclose(f); }
@@ -1377,6 +1507,8 @@ static void ring_save_check(uint64_t n) {
             for (int k2 = 0; px && k2 < r->sn; k2++) {
                 memcpy(px, r->smap + (size_t)k2 * g_stg_w * g_stg_h * 4, (size_t)g_stg_w * g_stg_h * 4); for (uint32_t i = 0; i < g_stg_w * g_stg_h; i++) px[i * 4 + 3] = 255;
                 char q[800]; snprintf(q, sizeof q, "%s/f%06llu_s%02d.png", dir, (unsigned long long)r->frame, k2); png_write(q, px, g_stg_w, g_stg_h);
+                if (r->hmap && r->hset[k2]) { snprintf(q, sizeof q, "%s/f%06llu_s%02d.f16", dir, (unsigned long long)r->frame, k2); FILE *hf = fopen(q, "wb");
+                                              if (hf) { fwrite(r->hmap + (size_t)k2 * g_stg_w * g_stg_h * 8, 1, (size_t)g_stg_w * g_stg_h * 8, hf); fclose(hf); } }
                 if (f) fprintf(f, "%02d %s\n", k2, r->lab[k2]);
             }
             free(px); if (f) fclose(f);

@@ -23,6 +23,7 @@ typedef struct {
     VkDescriptorPool *dpools; int ndp, cdp, dp_cur;      // reset when the submission completes (nvn_vk_draw.c)
     vkx_arena *arenas; int nar, car, ar_cur;             // likewise
     uint64_t submit_ns;                                   // when it went to the queue (the frame timing report: GPU busy estimate)
+    uint64_t frame; int ts;                               // the frame it was recorded in, and whether it carries its two GPU timestamps (mtl_gpu_ms)
     char log[8192]; int nlog; uint32_t ncrumb;                            // what it holds (draw / dispatch / DLSS), printed if the GPU never finishes it
 } sub_t;
 
@@ -55,10 +56,14 @@ extern uint64_t g_stats_draws;
 extern uint64_t g_presents;           // frames presented so far
 
 uint64_t vkx_now_ns(void);                              // monotonic nanoseconds (the slow-submit breakdown's clock)
-void vkx_sb_note(int what, uint64_t ns);                // per-submission driver-call time: 1 texture create, 2 descriptor writes, 3 pipeline create
+void vkx_sb_note(int what, uint64_t ns);                // per-submission driver-call time: 1 texture create, 2 descriptor writes, 3 pipeline create, 4 shader load
+void vkx_sb_time(int what, uint64_t ns);                // the same, time only (no new item)
+uint64_t vkx_frame(void);                               // the frame being recorded (mtl_set_frame)
 uint8_t *vkd_stage_alloc(sub_t *s, uint64_t n, VkBuffer *buf, uint64_t *off);   // host-visible staging from the submission's arenas (freed when it completes)
 void barrier_all(VkCommandBuffer cb);
 void vkx_ring_record(sub_t *s, vk_tex *col, vk_tex *dep);   // DM_VK_RING: this frame's scene and depth into the rolling capture
+void vkx_ring_mask(sub_t *s, VkImage img, uint32_t w, uint32_t h);   // DM_VK_RING_DLSS: the reactive mask after them
+void vkx_ring_dlss(sub_t *s, vk_tex *col, vk_tex *mot, vk_tex *dep, const float jit[2], const float mv[2]);   // DM_VK_RING_DLSS: the upscaler's inputs, raw
 void vkx_ring_note(const char *fmt, ...);                     // DM_VK_RING: a line of this frame's draw list
 void barrier_compute(VkCommandBuffer cb);             // after a dispatch: compute writes fenced, graphics pipeline left running
 void end_rendering(void);

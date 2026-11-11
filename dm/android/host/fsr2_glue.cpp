@@ -18,9 +18,18 @@
 #define FLOG(...) do { flockfile(stderr); fprintf(stderr, "[dm] [fsr2] " __VA_ARGS__); fputc('\n', stderr); funlockfile(stderr); } while (0)
 
 // -------- the environment switches, read once (as the backend's other DM_* switches are) --------
-static int g_sharpen = -1; static float g_sharpness, g_gap_ms;
+static int g_sharpen = -1, g_hdr; static float g_sharpness, g_gap_ms, g_jit[2] = {1, 1}, g_mvs[2] = {1, 1};
+static void pair_of(const char *name, float out[2]) { const char *e = getenv(name); if (e) { float a = 1, b = 1; if (sscanf(e, "%f,%f", &a, &b) >= 1) { out[0] = a; out[1] = b; } } }
 static void env_once(void) {
     if (g_sharpen >= 0) return;
+    // DM_FSR2_HDR (default 1): the colour as HDR, with FSR 2 measuring exposure itself. Fortune's Weave's colour is linear and goes above 1 although its DLSS flags
+    // (0x2000000a) ask for neither; the standard-range path assumes 0 to 1, and its history then held bright moving pixels: ghosting on the title screen. As Eden does
+    // for this game (eden-fefw .../vk_streamline_dlss.cpp "colour is linear and goes above 1 with no exposure passed"; vk_fsr3_upscaler.h: HDR colour, FSR's own exposure)
+    const char *h = getenv("DM_FSR2_HDR"); g_hdr = !h || h[0] != '0';
+    // DM_FSR2_JITTER / DM_FSR2_MV ("x,y", default "1,1"): multipliers on the game's jitter and motion vectors, to test their sign without a rebuild
+    pair_of("DM_FSR2_JITTER", g_jit); pair_of("DM_FSR2_MV", g_mvs);
+    FLOG("colour %s; jitter x %g y %g, motion vectors x %g y %g (DM_FSR2_HDR, DM_FSR2_JITTER, DM_FSR2_MV)", g_hdr ? "HDR with FSR 2's own exposure" : "as the game's flags say",
+         g_jit[0], g_jit[1], g_mvs[0], g_mvs[1]);
     const char *e = getenv("DM_FSR2_SHARPEN"); g_sharpen = !e || e[0] != '0';
     e = getenv("DM_FSR2_SHARPNESS"); g_sharpness = e ? (float)atof(e) : 0.3f;
     e = getenv("DM_FSR2_FRAME_DELTA_MAX"); g_gap_ms = e ? (float)atof(e) : 200.0f;
@@ -74,6 +83,7 @@ static void camera_of(const fsr2_job *j, float *cn, float *cf, float *fov) {
     if (j->flags & DLSS_F_DEPTH_INVERTED) { *cn = FLT_MAX; *cf = nearp; } else { *cn = nearp; *cf = 1000.0f; }
 }
 
+static int auto_exposure(const fsr2_job *j) { return g_hdr || (j->flags & DLSS_F_AUTO_EXPOSURE); }
 static int make_ctx(const fsr2_job *j, FfxFsr2Context *ctx) {
     if (!g_vk.ok || !g_vk.dev) { FLOG("[RED] no Vulkan device: FSR 2 cannot run"); return 0; }
     size_t need = ffxFsr2GetScratchMemorySizeVK(g_vk.pd);
@@ -85,7 +95,7 @@ static int make_ctx(const fsr2_job *j, FfxFsr2Context *ctx) {
     FfxFsr2ContextDescription d = {};
     d.flags = FFX_FSR2_ENABLE_DYNAMIC_RESOLUTION;
     if (j->flags & DLSS_F_DEPTH_INVERTED) d.flags |= FFX_FSR2_ENABLE_DEPTH_INVERTED | FFX_FSR2_ENABLE_DEPTH_INFINITE;   // reversed depth with no far plane (camera_of)
-    if (j->flags & DLSS_F_AUTO_EXPOSURE) d.flags |= FFX_FSR2_ENABLE_HIGH_DYNAMIC_RANGE | FFX_FSR2_ENABLE_AUTO_EXPOSURE;
+    if (auto_exposure(j)) d.flags |= FFX_FSR2_ENABLE_HIGH_DYNAMIC_RANGE | FFX_FSR2_ENABLE_AUTO_EXPOSURE;
     if (disp_mv(j)) d.flags |= FFX_FSR2_ENABLE_DISPLAY_RESOLUTION_MOTION_VECTORS;
     d.maxRenderSize = {j->iw, j->ih}; d.displaySize = {j->ow, j->oh};
     d.fpMessage = fsr2_message;
@@ -159,11 +169,15 @@ int fsr2_dispatch(const fsr2_job *j) {
     d.color = ffxGetTextureResourceVK(&g_ctx, j->color, j->color_v, j->iw, j->ih, j->color_fmt, NULL, FFX_RESOURCE_STATE_COMPUTE_READ);
     d.depth = ffxGetTextureResourceVK(&g_ctx, j->depth, j->depth_v, j->iw, j->ih, j->depth_fmt, NULL, FFX_RESOURCE_STATE_COMPUTE_READ);
     d.motionVectors = ffxGetTextureResourceVK(&g_ctx, j->motion, j->motion_v, disp_mv(j) ? j->ow : j->iw, disp_mv(j) ? j->oh : j->ih, j->motion_fmt, NULL, FFX_RESOURCE_STATE_COMPUTE_READ);
-    if (j->exposure && !(j->flags & DLSS_F_AUTO_EXPOSURE))
+    if (j->exposure && !auto_exposure(j))
         d.exposure = ffxGetTextureResourceVK(&g_ctx, j->exposure, j->exposure_v, 1, 1, j->exposure_fmt, NULL, FFX_RESOURCE_STATE_COMPUTE_READ);
     d.output = ffxGetTextureResourceVK(&g_ctx, j->output, j->output_v, j->ow, j->oh, j->output_fmt, NULL, FFX_RESOURCE_STATE_UNORDERED_ACCESS);
-    d.jitterOffset = {j->jitter[0], j->jitter[1]};   // the game's jitter as MetalFX takes it (its sign unchecked there too)
-    d.motionVectorScale = {j->mv[0], j->mv[1]};
+    if (j->reactive) {   // the reactive mask (nvn_vk_draw.c reactive_run), also as the transparency and composition mask: both shorten FSR 2's locks on thin detail
+        d.reactive = ffxGetTextureResourceVK(&g_ctx, j->reactive, j->reactive_v, j->iw, j->ih, VK_FORMAT_R8_UNORM, NULL, FFX_RESOURCE_STATE_COMPUTE_READ);
+        d.transparencyAndComposition = d.reactive;
+    }
+    d.jitterOffset = {j->jitter[0] * g_jit[0], j->jitter[1] * g_jit[1]};   // the game's jitter as Eden passes it to FSR 3.1 (DM_FSR2_JITTER to test its sign)
+    d.motionVectorScale = {j->mv[0] * g_mvs[0], j->mv[1] * g_mvs[1]};
     d.renderSize = {j->iw, j->ih};
     camera_of(j, &d.cameraNear, &d.cameraFar, &d.cameraFovAngleVertical);
     d.enableSharpening = g_sharpen != 0; d.sharpness = g_sharpness;

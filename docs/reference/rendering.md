@@ -895,12 +895,40 @@ The replay on Metal (`dm/gfx/nvn/nvn_mtl.m`) and the Vulkan and OpenGL layers. E
 - **Also in the host, not shown to be needed:** two one-pixel discarding draws at the start of each depth pass (`lrz_kick`, `DM_VK_LRZ_KICK=0` off), and storage buffers bound up to 1 MB past their size (`sbuf_open_on`, `DM_VK_SBUF_EXACT=1` off).
 - **Found on:** [Fire Emblem Fortune's Weave](../../dm/games/04007EF01F8AE000/README.md).
 
+### The early-depth kick wrote its pixel (the Android host)
+
+- **Symptom:** a dark four-sided patch with saw-tooth edges over lit ground, fixed to the ground as the camera moves; everything else in the frame right.
+- **Cause:** the host begins every depth pass with two one-pixel draws at pixel (0,0) whose fragment shader discards everything (`lrz_kick` in `dm/android/host/nvn_vk_exec.c`, see [A depth clear waits for its image's next pass](#a-depth-clear-waits-for-its-images-next-pass-the-android-host)). They were drawn at depth 0.5 with LESS and GREATER, so one of them could pass, and Qualcomm's Adreno 830 driver wrote its depth although the shader discards. In a full-size depth image that is one pixel; in a 1x1 shadow map it is the whole image, and the ground inside that map's square read as shadowed.
+- **Fix:** each draw is at the depth that cannot pass its own compare (LESS at 1, GREATER at 0; the depth is the draw's first instance, `shaders/lrz.vert`). The battle floors the kick protects stayed whole in play on the Odin 3; the work folder's `re/lrztest` has the new draws as methods `h` and `i`: after the sequence that makes the stale copy (`03`: 288 to 300 of 300 frames with holes), no frame with holes in 300 for either, with and without the extra passes (mask 447), the same as the old draws (`f`).
+- **Found on:** [Fire Emblem Fortune's Weave](../../dm/games/04007EF01F8AE000/README.md), the world map: its shadow maps there are 1x1 placeholders cleared to 1 every frame.
+- **How it was found:** the 8-bit stage snapshots were white from the lighting pass on, so `DM_VK_RING_STAGES=2` (16-bit float snapshots) was added: the patch first appears in the lighting draw's output, about 8 times darker inside than beside it, with every G-buffer input and the shadow mask identical inside and outside. The patch's shape is one square texel seen in perspective, and pixel (0,0) of the scene's depth image differed from every other pixel in all 8 captured frames (capture `logs_mem3/000966`).
+
 ### Uniform buffers off the device's offset alignment (the Android host)
 
 - **Symptom:** a mesh drawn with wrong constants in single frames.
 - **Cause:** NVN binds a uniform buffer at any offset; Vulkan requires `minUniformBufferOffsetAlignment` (64 on the Adreno 830). The host bound at the lower boundary, so the shader read its constants shifted by up to 63 bytes.
 - **Fix:** such a buffer is bound through an aligned copy of its bytes (`ub_copy` in `stage_set`, `dm/android/host/nvn_vk_draw.c`). Storage buffers are offset in the shader instead (`sb_align` in `dm/gfx/tools/vk_spirv.py`).
 - **Found on:** [Fire Emblem Fortune's Weave](../../dm/games/04007EF01F8AE000/README.md): its constant ring moves with each frame's draws, so a frame with more of them put the floor's G-buffer constants off the boundary.
+
+### How wrong pictures on the Android host were found
+
+For a wrong picture on the Android Vulkan host, measure in this order and stop guessing at each step: which pass, which draw, wrong inputs or wrong GPU result. Every capture below is the rolling capture (`DM_VK_RING=<frames>` in `run/env.txt`, written when `run/ring_save` is touched); trigger it only while the fault is on screen, and check that the saved scene shows the fault before analysing anything else.
+
+| Step | Question | Tool |
+|---|---|---|
+| 1 | Which pass first shows it? | `DM_VK_RING_STAGES=1`: a 160x90 snapshot after every pass (`f<frame>_s<nn>.png`, `_stages.txt`). `=2` also saves each as 16-bit float (`.f16`): the 8-bit ones are white for everything above 1, which is every lit scene before tone mapping. View with the work folder's `re/tools/f16sheet.py` |
+| 2 | Which draw in that pass? | `f<frame>_draws.txt` lists the draws between two `STAGE` lines; `DM_VK_RING_OCC=1` adds each draw's pixel count (`occ`), which separates draws that cover the faulty area from those that do not |
+| 3 | Inputs or GPU? | Compare each input's snapshot inside and outside the faulty area (mean of a box in each). Identical inputs and a different output: the fault is in what the draw reads that has no snapshot (small textures, buffers) or in the GPU's result. Then re-run the shader on the PC's GPU with the captured inputs (`re/tools/vsrun.py`, `re/csrun`): the PC agreeing with the device means wrong inputs, disagreeing means the driver |
+| 4 | Whose handling differs? | Diff the Android host's handling of the op against `gfx/nvn/nvn_mtl.m`, which runs the same game correctly |
+
+`DM_VK_TRACE=<frame>`, or a `run/trace_now` file for the next frame, logs each draw's bindings (`trace draw`, `trace dispatch`): a draw's bindings follow its line, a dispatch's bindings come before its line.
+
+Cases solved this way (Fire Emblem Fortune's Weave, Adreno 830):
+
+- **Black ribbons from wind props.** Stage snapshots: the depth pre-pass. Occlusion counts: a few wind-prop draws covering far more pixels than their neighbours. PC re-run of the vertex shader on the captured vertex data (`re/tools/windrun.py`): correct positions, so the inputs differed on the device. Diff against `nvn_mtl.m`: the attribute bind only grew the attribute count, leaving a stale attribute. What did not work: ten rounds of one-theory tests (shader translation variants, integer inputs). → [reference entry](#vertex-attribute-and-stream-binds-replace-the-table-the-android-host)
+- **Ghosting behind moving objects with FSR 2.** Turning FSR 2 off removed it (so: the upscaler's inputs). `DM_VK_RING_DLSS=1` dumps the colour, motion vectors and depth FSR 2 receives; `re/tools/mvcheck.py` showed zero motion vectors on the moving objects and `jitcheck.py` that the jitter signs were right. Fix: a reactive mask made from the picture (`shaders/reactive.comp`). The mask then seemed to do nothing: dumping the mask itself (`vkx_ring_mask`) showed only its top 68 rows written, which was the driver running `LocalSizeId` 8x8 as 8x1. What did not work: FSR 2 flags (HDR, auto exposure), judging the mask by eye instead of dumping it.
+- **Frame-rate dips.** The `[longframe]` log line splits a long frame into pipeline creation, shader loading, uploads and GPU time: the dips were first-use pipeline compiles and a 47 MB pipeline-cache rewrite every 300 frames, not GPU load.
+- **Dark patch on the world map.** Three suspect tests (background pipeline building, a device feature, the pipeline cache) each cost a run and ruled nothing in. Then: the 8-bit stage snapshots were all white after lighting, so float snapshots were added (`DM_VK_RING_STAGES=2`); they named the lighting draw. Box means inside and outside the patch showed every input snapshot identical, so the cause was an input without a snapshot. The shape (one square seen in perspective, saw-tooth edges) pointed at a single shadow-map texel, the trace showed the shadow maps were 1x1, and the scene's depth image had one odd pixel at (0,0), where the host's own early-depth kick draws. What misled: reading a dispatch's bindings against the wrong shader in the trace, and assuming the fault was in the tile table because the lighting reads it. → [reference entry](#the-early-depth-kick-wrote-its-pixel-the-android-host)
 
 ### The Android host's rolling capture
 

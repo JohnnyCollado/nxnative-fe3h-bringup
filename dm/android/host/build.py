@@ -141,7 +141,7 @@ def main():
     inc = [os.path.join(DM, 'android', 'compat', 'include'), os.path.join(DM, 'gfx', 'nvn', 'include'), os.path.join(DM, 'third_party', 'vulkan-headers', 'include'),
            gen, os.path.join(DM, 'third_party', 'libvpx'), os.path.join(DM, 'third_party', 'dav1d', 'include'), os.path.join(DM, 'third_party', 'stb_vorbis'), HOST,
            os.path.join(DM, 'gfx', 'nvn'), os.path.join(DM, 'gfx', 'tex'), os.path.join(HOST, 'gen', 'msl-macosx'),
-           os.path.join(DM, 'third_party', 'volk'), os.path.join(DM, 'third_party', 'libadrenotools', 'include')]
+           os.path.join(DM, 'third_party', 'volk'), os.path.join(DM, 'third_party', 'libadrenotools', 'include'), os.path.join(DM, 'third_party', 'lsfg-eden')]
     cflags = target + ['-O1', '-g', '-std=gnu11', '-fPIE', '-Wall', '-Wno-unused-function', '-Wno-unknown-pragmas', '-D_GNU_SOURCE', '-DDM_ANDROID=1', '-DVK_USE_PLATFORM_ANDROID_KHR=1',
                        '-include', 'dm_android_compat.h'] + ['-I' + p for p in inc]
     # third-party code keeps its own flags (as the Mac Makefile builds it), without the host's compat header
@@ -186,6 +186,13 @@ def main():
                           '-I' + os.path.join(DM, 'third_party', 'vulkan-headers', 'include')]
     add('fsr2', [os.path.join(fsr, 'ffx_fsr2.cpp'), os.path.join(fsr, 'vk', 'ffx_fsr2_vk.cpp'), os.path.join(fsr, 'vk', 'shaders', 'ffx_fsr2_shaders_vk.cpp'),
                  os.path.join(HERE, 'fsr2_glue.cpp')], fsr_flags, DM)
+
+    # Lossless Scaling frame generation (dm/third_party/lsfg-eden, GPL-3.0-or-later): Eden's LSFG sources unchanged, its compat/ headers standing in for Eden's
+    # Vulkan wrapper, device, allocator and file helpers, and lsfg_glue.cpp behind the C interface nvn_vk_front.c calls (DM_LSFG=1, the user's own Lossless.dll)
+    lsfg = os.path.join(DM, 'third_party', 'lsfg-eden')
+    lsfg_flags = target + ['-O2', '-g', '-fPIE', '-std=c++20', '-D_GNU_SOURCE', '-DVK_USE_PLATFORM_ANDROID_KHR=1', '-I' + os.path.join(lsfg, 'compat'), '-I' + lsfg,
+                           '-I' + os.path.join(DM, 'third_party', 'volk'), '-I' + os.path.join(DM, 'third_party', 'vulkan-headers', 'include')]
+    add('lsfg', sorted(glob.glob(os.path.join(lsfg, 'video_core', '*', '*.cpp')) + glob.glob(os.path.join(lsfg, 'video_core', '*', '*', '*.cpp'))) + [os.path.join(lsfg, 'lsfg_glue.cpp')], lsfg_flags, DM)
 
     todo = [j for j in jobs if stale(j[1], j[1][:-2] + '.d', j[3])]
     print(f'{len(jobs)} objects, {len(todo)} to compile ({a.j} at a time)', flush=True)

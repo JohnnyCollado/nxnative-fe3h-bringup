@@ -85,7 +85,7 @@ class SettingsPanel(context: Context, private val settings: Settings, private va
     private fun show(c: Settings.Choice) {
         val r = rows[c] ?: return
         val on = edit == c
-        r.view.background = if (on) FeTheme.framed(context, "purple") else FeTheme.states(context, "cream", "cream")
+        r.view.background = if (on) FeTheme.plaque(context, "rowsel") else FeTheme.states(context, "cream", "rowsel")
         FeTheme.plaquePadding(r.view)
         val ink = if (on) FeTheme.BRIGHT else FeTheme.INK
         r.name.setTextColor(ink); r.value.setTextColor(if (on) FeTheme.GOLD else ink)
