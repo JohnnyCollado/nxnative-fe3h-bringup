@@ -12,6 +12,7 @@
 #include <errno.h>
 #include <pthread.h>
 #include <stddef.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/un.h>
@@ -45,6 +46,94 @@ static int lsfg_on(void) {
     if (on < 0) { const char *e = getenv("DM_LSFG"); on = e && e[0] == '1' ? lsfg_init(g_vk.dev, g_vk.pd, g_vk.mem_model, g_vk.null_desc, g_vk.fp16) : 0; }
     return on;
 }
+
+// ---------- frame generation: no generated frame across a large change (DM_LSFG_SKIP) ----------
+// The generator sees two finished pictures and nothing of depth or motion. When the picture changes a lot between two real frames (a fast camera turn at the game's 30
+// frames a second) its frame comes out warped: a ghost outline where a character was, shredded edges, worst over repeating steps (Fire Emblem Fortune's Weave; flow
+// scale 1.0 and LSFG's quality model did not change it). LSFG-Android's "anti-artifacts" option answers that by not showing the generated frame for such a pair, and
+// this is its measure: each real frame shrunk to a 32x18 grid, the mean absolute difference of the grid's brightness (0 to 255) against the last real frame's; at
+// DM_LSFG_SKIP or more (26 there) the generated frame of the pair is not sent and the real one follows at its usual time, so that stretch shows as plain 30 frames a
+// second. Once skipping, it goes on until the measure falls under three quarters of the threshold. 0 or unset: measured and logged only. The grid is read by the sender
+// thread after the frame's fence, before it would send the generated frame. The shrink goes through two steps of four (512x288, 128x72, then the grid), each a linear
+// blit, so a grid cell is an average over its area: shrunk in one step each cell was a single sample, fine detail and the upscaler's shimmer flickered in it, and a
+// calm title screen measured 18 to 20 with a third of the pairs over 26.
+enum { GRID_W = 32, GRID_H = 18, GRID_N = GRID_W * GRID_H };
+static VkImage g_grid_img, g_grid_mid[2]; static VkDeviceMemory g_grid_imem, g_grid_mmem[2], g_grid_bmem; static VkBuffer g_grid_buf; static uint8_t *g_grid_map; static int g_grid_state;   // 0 not made, 1 ready, -1 failed
+static uint8_t g_grid_set[DMF_MAX_BUFFERS], g_grid_prev[GRID_N]; static int g_grid_have, g_skipping, g_skip_thr = -1;
+static uint64_t g_mo_pairs, g_mo_sum, g_mo_skipped, g_mo_hist[4]; static int g_mo_max;
+static int grid_ready(void) {
+    if (g_grid_state) return g_grid_state > 0;
+    g_grid_state = -1;
+    { const char *e = getenv("DM_LSFG_SKIP"); g_skip_thr = e ? atoi(e) : 0; if (g_skip_thr < 0) g_skip_thr = 0; }
+    VkPhysicalDeviceMemoryProperties mp; vkGetPhysicalDeviceMemoryProperties(g_vk.pd, &mp);
+    VkImageCreateInfo ii = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, NULL, 0, VK_IMAGE_TYPE_2D, VK_FORMAT_R8G8B8A8_UNORM, {GRID_W, GRID_H, 1}, 1, 1, VK_SAMPLE_COUNT_1_BIT, VK_IMAGE_TILING_OPTIMAL,
+                            VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT, VK_SHARING_MODE_EXCLUSIVE, 0, NULL, VK_IMAGE_LAYOUT_UNDEFINED};
+    if (vkCreateImage(g_vk.dev, &ii, NULL, &g_grid_img)) return 0;
+    for (int k = 0; k < 2; k++) {   // the two steps between the frame and the grid
+        VkImageCreateInfo mi = ii; mi.extent = (VkExtent3D){k ? GRID_W * 4 : GRID_W * 16, k ? GRID_H * 4 : GRID_H * 16, 1};
+        if (vkCreateImage(g_vk.dev, &mi, NULL, &g_grid_mid[k])) return 0;
+        VkMemoryRequirements r2; vkGetImageMemoryRequirements(g_vk.dev, g_grid_mid[k], &r2); uint32_t t2 = 0;
+        while (t2 < mp.memoryTypeCount && !((r2.memoryTypeBits >> t2 & 1) && (mp.memoryTypes[t2].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT))) t2++;
+        if (t2 == mp.memoryTypeCount) { t2 = 0; while (t2 < mp.memoryTypeCount && !(r2.memoryTypeBits >> t2 & 1)) t2++; }
+        VkMemoryAllocateInfo a2 = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, NULL, r2.size, t2};
+        if (t2 == mp.memoryTypeCount || vkAllocateMemory(g_vk.dev, &a2, NULL, &g_grid_mmem[k]) || vkBindImageMemory(g_vk.dev, g_grid_mid[k], g_grid_mmem[k], 0)) return 0;
+    }
+    VkMemoryRequirements mr; vkGetImageMemoryRequirements(g_vk.dev, g_grid_img, &mr); uint32_t t = 0;
+    while (t < mp.memoryTypeCount && !((mr.memoryTypeBits >> t & 1) && (mp.memoryTypes[t].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT))) t++;
+    if (t == mp.memoryTypeCount) { t = 0; while (t < mp.memoryTypeCount && !(mr.memoryTypeBits >> t & 1)) t++; }
+    VkMemoryAllocateInfo mai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, NULL, mr.size, t};
+    if (t == mp.memoryTypeCount || vkAllocateMemory(g_vk.dev, &mai, NULL, &g_grid_imem) || vkBindImageMemory(g_vk.dev, g_grid_img, g_grid_imem, 0)) return 0;
+    VkBufferCreateInfo bci = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, NULL, 0, (VkDeviceSize)DMF_MAX_BUFFERS * GRID_N * 4, VK_BUFFER_USAGE_TRANSFER_DST_BIT, VK_SHARING_MODE_EXCLUSIVE};
+    if (vkCreateBuffer(g_vk.dev, &bci, NULL, &g_grid_buf)) return 0;
+    vkGetBufferMemoryRequirements(g_vk.dev, g_grid_buf, &mr); t = 0;
+    const VkMemoryPropertyFlags hv = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+    while (t < mp.memoryTypeCount && !((mr.memoryTypeBits >> t & 1) && (mp.memoryTypes[t].propertyFlags & hv) == hv)) t++;
+    VkMemoryAllocateInfo bai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, NULL, mr.size, t}; void *m = NULL;
+    if (t == mp.memoryTypeCount || vkAllocateMemory(g_vk.dev, &bai, NULL, &g_grid_bmem) || vkBindBufferMemory(g_vk.dev, g_grid_buf, g_grid_bmem, 0) || vkMapMemory(g_vk.dev, g_grid_bmem, 0, VK_WHOLE_SIZE, 0, &m)) return 0;
+    g_grid_map = m; g_grid_state = 1;
+    VLOG("frame generation: the change between real frames is measured on a %dx%d grid; %s (DM_LSFG_SKIP)", GRID_W, GRID_H,
+         g_skip_thr ? "a generated frame across a large change is not shown" : "logged only, every generated frame is shown");
+    return 1;
+}
+// records the shrink of real frame i (its image in layout GENERAL) into the grid buffer's slot i
+static void grid_record(VkCommandBuffer cb, VkImage img, int i) {
+    if (!grid_ready()) return;
+    VkImage chain[4] = {img, g_grid_mid[0], g_grid_mid[1], g_grid_img};
+    int32_t cw[4] = {(int32_t)g_w, GRID_W * 16, GRID_W * 4, GRID_W}, chh[4] = {(int32_t)g_h, GRID_H * 16, GRID_H * 4, GRID_H};
+    for (int k = 1; k < 4; k++) {   // each step: its image made writable, the one before blitted into it, then made readable for the next
+        VkImageMemoryBarrier b0 = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, NULL, 0, VK_ACCESS_TRANSFER_WRITE_BIT, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                                   VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, chain[k], {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}};
+        vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1, &b0);
+        VkImageBlit bl = {{VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {{0, 0, 0}, {cw[k - 1], chh[k - 1], 1}}, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {{0, 0, 0}, {cw[k], chh[k], 1}}};
+        vkCmdBlitImage(cb, chain[k - 1], k == 1 ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, chain[k], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &bl, VK_FILTER_LINEAR);
+        VkImageMemoryBarrier b1 = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, NULL, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                                   VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, chain[k], {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}};
+        vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1, &b1);
+    }
+    VkBufferImageCopy c = {(VkDeviceSize)i * GRID_N * 4, 0, 0, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, 0, 0}, {GRID_W, GRID_H, 1}};
+    vkCmdCopyImageToBuffer(cb, g_grid_img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, g_grid_buf, 1, &c);
+    g_grid_set[i] = 1;
+}
+static void grid_luma(int i, uint8_t out[GRID_N]) { const uint8_t *p = g_grid_map + (size_t)i * GRID_N * 4; for (int k = 0; k < GRID_N; k++, p += 4) out[k] = (uint8_t)((77 * p[0] + 150 * p[1] + 29 * p[2]) >> 8); }
+// the sender thread, real frame i drawn: 1 when the generated frame from the last real frame to this one should not be shown
+static int grid_skip(int i) {
+    if (g_grid_state != 1 || !g_grid_set[i] || !g_grid_have) return 0;
+    uint8_t cur[GRID_N]; grid_luma(i, cur); uint32_t sum = 0;
+    for (int k = 0; k < GRID_N; k++) sum += (uint32_t)(cur[k] > g_grid_prev[k] ? cur[k] - g_grid_prev[k] : g_grid_prev[k] - cur[k]);
+    int d = (int)(sum / GRID_N);
+    g_mo_pairs++; g_mo_sum += (uint64_t)d; if (d > g_mo_max) g_mo_max = d;
+    g_mo_hist[0] += d >= 10; g_mo_hist[1] += d >= 16; g_mo_hist[2] += d >= 26; g_mo_hist[3] += d >= 40;
+    int skip = g_skip_thr > 0 && d >= (g_skipping ? g_skip_thr * 3 / 4 : g_skip_thr);
+    g_skipping = skip; g_mo_skipped += (uint64_t)skip;
+    if (g_mo_pairs % 600 == 0) {
+        VLOG("frame generation: change between real frames mean %.1f, max %d of 255 over 600 pairs; at or over 10 / 16 / 26 / 40: %llu / %llu / %llu / %llu; generated frames not shown %llu (DM_LSFG_SKIP %d)",
+             (double)g_mo_sum / 600.0, g_mo_max, (unsigned long long)g_mo_hist[0], (unsigned long long)g_mo_hist[1], (unsigned long long)g_mo_hist[2], (unsigned long long)g_mo_hist[3],
+             (unsigned long long)g_mo_skipped, g_skip_thr);
+        g_mo_sum = 0; g_mo_max = 0; g_mo_skipped = 0; memset(g_mo_hist, 0, sizeof g_mo_hist);
+    }
+    return skip;
+}
+static void grid_keep(int i) { if (g_grid_state == 1 && g_grid_set[i]) { grid_luma(i, g_grid_prev); g_grid_have = 1; g_grid_set[i] = 0; } }
 
 static int send_msg(const dmf_msg *m) { return send(g_fd, m, sizeof *m, MSG_NOSIGNAL) == (ssize_t)sizeof *m; }
 static int send_raw(const void *p, size_t n) { return g_fd >= 0 && send(g_fd, p, n, MSG_NOSIGNAL) == (ssize_t)n; }
@@ -87,6 +176,8 @@ static void *sender(void *unused) {
         int i = q.i;
         VkResult r = vkWaitForFences(g_vk.dev, 1, &B[q.fence_of].fence, VK_TRUE, 5000000000ull);
         if (r) { VRED_ONCE("a frame for the screen did not finish drawing (%d)", r); }
+        int skip = q.gen && !r ? grid_skip(q.fence_of) : 0;   // a generated frame across a large change is not shown (DM_LSFG_SKIP)
+        if (!q.gen && !r) grid_keep(q.i);
         if (!q.gen) vkResetFences(g_vk.dev, 1, &B[q.fence_of].fence);   // a generated frame leaves its real frame's fence to that frame's own turn
         {   // frame generation's pacing: the generated frame goes out at once, its real frame half a frame interval later
             static struct timespec gen_at; static int have_gen;
@@ -98,7 +189,7 @@ static void *sender(void *unused) {
         }
         dmf_msg m = {DMF_FRAME, (uint32_t)i};
         pthread_mutex_lock(&g_mu);
-        int ok = !g_dead && !r && send_msg(&m);
+        int ok = !g_dead && !r && !skip && send_msg(&m);
         B[i].state = ok ? FB_SHOWN : FB_FREE; if (ok) g_shown++;
         pthread_mutex_unlock(&g_mu);
     }
@@ -214,6 +305,7 @@ void vkd_front_present(vk_tex *x, const int crop[4]) {
         VkImageMemoryBarrier tg = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, NULL, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
                                    VK_IMAGE_LAYOUT_GENERAL, VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, b->img, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}};
         vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1, &tg);
+        grid_record(cb, b->img, i);
         if (lsfg_frame(cb, b->img, VK_FORMAT_R8G8B8A8_UNORM, g_w, g_h)) {
             pthread_mutex_lock(&g_mu);
             for (int k = 0; k < g_nb; k++) if (k != i && B[k].state == FB_FREE) { gi = k; B[k].state = FB_DRAWING; break; }

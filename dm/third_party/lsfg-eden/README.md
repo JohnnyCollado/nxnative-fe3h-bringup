@@ -17,7 +17,28 @@ Lossless Scaling (a paid Windows app, on Steam) generates frames between two rea
 ## Settings
 
 - `DM_LSFG=1`: on (the launcher's Frame generation setting).
+- `DM_LSFG_SKIP=<n>` (0 or unset: measured and logged only): no generated frame when the mean change of a 32x18 brightness grid between two real frames is n of 255 or more.
 - `DM_LSFG_FLOW_SCALE` (0.25 to 1, default 0.5): the optical flow's resolution against the output, as Eden's automatic choice gives for a 960-wide picture shown at 1920.
+
+## What it costs and what it cannot do (Odin 3, Adreno 830, Fire Emblem Fortune's Weave)
+
+GPU busy on the title screen, ten one-second readings of `/sys/class/kgsl/kgsl-3d0/gpu_busy_percentage` each (2026-11-12, Turnip):
+
+| Setup | GPU busy | Frames shown per 600 real |
+|---|---|---|
+| Docked, off | 44 % | 600 |
+| Docked, flow 0.25 | 79 % | 1,192 |
+| Docked, flow 0.5 | 87 % | 1,187 |
+| Docked, flow 1.0 | 92 % | 1,190 |
+| Handheld, off | 66 % (GPU clock 1.05 GHz, the others 1.10) | 599 |
+| Handheld, flow 0.5 | 72 % | 1,190 |
+
+In play (looping a staircase with the camera turning, the same day): docked at flow 0.5 87 % and handheld at flow 0.5 72 % (GPU clock 1.05 GHz), both at 33.3 ms a real frame with every generated frame shown; the quality model at flow 0.75 99 %, 39.9 ms a frame and a third of the generated frames.
+
+- Docked mode has the game upscale to 2048x1152 and the chain work at that size; handheld mode gives 1920x1080 for both, which is where the room comes from.
+- **The quality model is not here.** Lossless.dll also holds LSFG 3.1's quality shaders (the performance ones' resource IDs minus 23; lsfg-vk's `v3.1_src` beside `v3.1p_src`, the same six stages with about twice the feature images). Ported for a test: 90 % at flow 0.25, 99 % at 0.5 with a third of the generated frames made and the game at 25 fps; no difference to the eye on a fast camera turn. Taken out again.
+- **Warped frames on a fast camera turn** (a ghost outline where a character was, shredded edges, worst over repeating steps) are the generator's limit at 30 real frames a second: it sees two pictures and nothing of depth or motion. Flow 1.0 and the quality model did not change it. The host can leave the generated frame out across a large change (`DM_LSFG_SKIP`, the app's Fast motion setting; `dm/android/host/nvn_vk_front.c`, after LSFG-Android's anti-artifacts option): its measure reads about 0.4 on the calm title screen and up to 101 on cuts and fast action. The thresholds behind the setting (26, 16) are LSFG-Android's and a guess, not yet set from play.
+- The game has a motion blur task of its own (`gfxa::TaskMotionBlur` in main). A game's blur sized for 30 frames a second is twice too long at 60 shown; whether it runs outside cutscenes has not been checked.
 
 ## Requirements
 
