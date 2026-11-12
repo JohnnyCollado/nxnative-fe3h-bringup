@@ -377,6 +377,47 @@ static int shd_load(shd *s) {   // a shader's first use reads its SPIR-V from st
     if (s->loaded) return !s->bad;
     uint64_t t0 = vkx_now_ns(); int ok = shd_load_do(s); vkx_sb_note(4, vkx_now_ns() - t0); return ok;
 }
+// A per-pixel index into an array of textures or samplers is marked NonUniform. A translated shader picks a texture by an index it computes for each pixel (Fire
+// Emblem Fortune's Weave's lighting draw 88d7f48d93663021: the reflection probe a pixel belongs to, out of an array of 32 cube maps); Vulkan leaves such an index
+// undefined unless the access is decorated NonUniform, and the translator does not decorate. Qualcomm's driver takes each pixel's own index anyway; Turnip took one
+// index for several pixels, so pixels beside an edge got their neighbour's probe: light or dark squares beside stone edges and stepped shadow edges, with Turnip only
+// (the work folder's re/csrun/psrun_cap drew the captured draw on both drivers: 2,620 pixels differed, 140 by rounding once the accesses were marked; nonuniform.py
+// there is this pass). Marked: each access chain into such an array with an index that is not a constant, what is loaded through it, and a sampled image made from
+// that; with the ShaderNonUniform and SampledImageArrayNonUniformIndexing capabilities and SPV_EXT_descriptor_indexing. Only where the device has the feature
+// (g_vk.nonuniform); DM_VK_NONUNIFORM=0: as translated. Returns the ids marked
+static uint32_t spv_nonuniform(uint32_t **pw, size_t *pnw) {
+    static int on = -1; if (on < 0) { const char *e = getenv("DM_VK_NONUNIFORM"); on = g_vk.nonuniform && !(e && e[0] == '0');
+        VLOG("texture arrays indexed per pixel %s", on ? "are marked NonUniform (each pixel takes its own index on any driver)" : g_vk.nonuniform ? "as translated (DM_VK_NONUNIFORM=0)" : "as translated (the device lacks shaderSampledImageArrayNonUniformIndexing)"); }
+    if (!on) return 0;
+    uint32_t *w = *pw; size_t nw = *pnw; uint32_t bound = w[3], n = 0;
+    uint8_t *opaque = calloc(bound, 1), *arrv = calloc(bound, 1), *cst = calloc(bound, 1), *mark = calloc(bound, 1); uint32_t *arr = calloc(bound, 4), *ptr = calloc(bound, 4);
+    for (size_t i = 5; i < nw; ) { uint32_t op = w[i] & 0xffff, len = w[i] >> 16; if (!len || i + len > nw) break;
+        if (op == SPV_TYPE_IMAGE && len >= 8 && w[i + 1] < bound) opaque[w[i + 1]] = w[i + 7] != 2;              // not a storage image (another capability)
+        else if ((op == SPV_TYPE_SAMPLER || op == 27) && w[i + 1] < bound) opaque[w[i + 1]] = 1;                   // 27: OpTypeSampledImage
+        else if ((op == SPV_TYPE_ARRAY || op == SPV_TYPE_RTARRAY) && w[i + 1] < bound) arr[w[i + 1]] = w[i + 2];
+        else if (op == SPV_TYPE_POINTER && len == 4 && w[i + 1] < bound) ptr[w[i + 1]] = w[i + 3];
+        else if ((op == 41 || op == 42 || op == 43 || op == 44 || op == 46) && len >= 3 && w[i + 2] < bound) cst[w[i + 2]] = 1;   // constants
+        else if (op == SPV_VARIABLE && len >= 4 && w[i + 2] < bound && w[i + 1] < bound) { uint32_t t = ptr[w[i + 1]]; arrv[w[i + 2]] = t < bound && arr[t] && arr[t] < bound && opaque[arr[t]]; }
+        else if ((op == 65 || op == 66) && len >= 5 && w[i + 2] < bound && w[i + 3] < bound && arrv[w[i + 3]] && w[i + 4] < bound && !cst[w[i + 4]]) { mark[w[i + 2]] = 1; n++; }   // OpAccessChain
+        else if (op == 61 && len >= 4 && w[i + 2] < bound && w[i + 3] < bound && mark[w[i + 3]]) { mark[w[i + 2]] = 1; n++; }                                                     // OpLoad
+        else if (op == 86 && len >= 5 && w[i + 2] < bound && ((w[i + 3] < bound && mark[w[i + 3]]) || (w[i + 4] < bound && mark[w[i + 4]]))) { mark[w[i + 2]] = 1; n++; }        // OpSampledImage
+        else if (op == 100 && len >= 4 && w[i + 2] < bound && w[i + 3] < bound && mark[w[i + 3]]) { mark[w[i + 2]] = 1; n++; }                                                    // OpImage
+        i += len; }
+    if (n) {
+        static const char ext[] = "SPV_EXT_descriptor_indexing"; uint32_t extw[8] = {0}; memcpy(extw, ext, sizeof ext); uint32_t nextw = (uint32_t)(sizeof ext + 3) / 4;
+        uint32_t *o = malloc((nw + 4 + 1 + nextw + 3 * (size_t)n) * 4); size_t no = 0; int done_ext = w[1] >= 0x10500, done_dec = 0;
+        memcpy(o, w, 20); no = 5; o[no++] = 2u << 16 | 17; o[no++] = 5301; o[no++] = 2u << 16 | 17; o[no++] = 5307;   // OpCapability ShaderNonUniform, SampledImageArrayNonUniformIndexing
+        for (size_t i = 5; i < nw; ) { uint32_t op = w[i] & 0xffff, len = w[i] >> 16; if (!len || i + len > nw) break;
+            if (!done_ext && op != 17 && op != 10) { o[no++] = (nextw + 1) << 16 | 10; memcpy(o + no, extw, nextw * 4); no += nextw; done_ext = 1; }   // OpExtension, after the capabilities and extensions
+            if (!done_dec && op != 17 && op != 10 && op != 11 && op != 14 && op != 15 && op != 16 && !(op >= 3 && op <= 8) && op != 330 && op != 331) {   // the annotations start here at the latest
+                for (uint32_t id = 0; id < bound; id++) if (mark[id]) { o[no++] = 3u << 16 | SPV_DECORATE; o[no++] = id; o[no++] = 5300; }
+                done_dec = 1; }
+            memcpy(o + no, w + i, len * 4); no += len; i += len; }
+        free(w); *pw = o; *pnw = no;
+    }
+    free(opaque); free(arrv); free(cst); free(mark); free(arr); free(ptr);
+    return n;
+}
 static int shd_load_do(shd *s) {
     s->loaded = 1; s->bad = 1;
     char p[600]; snprintf(p, sizeof p, "%s/%016llx.spv", g_spirv_dir, (unsigned long long)s->key);
@@ -385,6 +426,7 @@ static int shd_load_do(shd *s) {
     uint32_t *w = malloc((size_t)n); size_t nw = fread(w, 1, (size_t)n, f) / 4; fclose(f);
     if (nw < 5 || w[0] != 0x07230203) { VLOG("[RED] shader %016llx: not SPIR-V", (unsigned long long)s->key); free(w); return 0; }
     { static uint64_t nshd, nvars; uint32_t z = zero_locals(&w, &nw); if (z) { nshd++; nvars += z; if (nshd == 1 || nshd % 500 == 0) VLOG("registers read before a write read zero: %llu shaders, %llu variables given a zero initialiser so far", (unsigned long long)nshd, (unsigned long long)nvars); } }
+    { static uint64_t nshd, nids; uint32_t m = spv_nonuniform(&w, &nw); if (m) { nshd++; nids += m; if (nshd == 1 || nshd % 200 == 0) VLOG("texture array accesses marked NonUniform: %llu shaders, %llu ids so far", (unsigned long long)nshd, (unsigned long long)nids); } }
     uint32_t bound = w[3];
     uint32_t *def = calloc(bound, 4), *bind_w = calloc(bound, 4), *set_w = calloc(bound, 4), *loc = calloc(bound, 4); uint8_t *blk = calloc(bound, 1), *bi = calloc(bound, 1);
     uint32_t *vars = malloc(nw * 4); int nv = 0; uint32_t *name_at = calloc(bound, 4);
@@ -743,7 +785,8 @@ static void shared_buffers(void) {
 }
 
 // ---------- Samplers and sampling views ----------
-typedef struct { samp_par p; VkSampler s; } samp_ent;
+typedef struct { samp_par p; VkSampler s; VkSamplerCreateInfo si; int custom; } samp_ent;
+static const samp_ent *g_samp_last;   // the sampler sampler_of gave last (DM_VK_PS_DUMP)
 enum { NSAMP = 4096 };
 static samp_ent g_samp[NSAMP]; static int g_nsamp_used;
 static VkSamplerAddressMode wrap_vk(int w) {
@@ -761,7 +804,7 @@ static VkSampler sampler_of_(const samp_par *sp) {
     uint32_t h = 2166136261u; const uint8_t *q = (const uint8_t *)sp; for (size_t i = 0; i < sizeof *sp; i++) h = (h ^ q[i]) * 16777619u;
     for (uint32_t i = h & (NSAMP - 1), k = 0; k < NSAMP; i = (i + 1) & (NSAMP - 1), k++) {
         samp_ent *e = &g_samp[i];
-        if (e->s && !memcmp(&e->p, sp, sizeof *sp)) return e->s;
+        if (e->s && !memcmp(&e->p, sp, sizeof *sp)) { g_samp_last = e; return e->s; }
         if (e->s) continue;
         int mip = sp->minf >= NVN_MIN_FILTER_NEAREST_MIPMAP_NEAREST;
         VkSamplerCustomBorderColorCreateInfoEXT cb = {VK_STRUCTURE_TYPE_SAMPLER_CUSTOM_BORDER_COLOR_CREATE_INFO_EXT, NULL, {.float32 = {sp->border[0], sp->border[1], sp->border[2], sp->border[3]}}, VK_FORMAT_UNDEFINED};
@@ -780,7 +823,7 @@ static VkSampler sampler_of_(const samp_par *sp) {
         if (si.maxLod < si.minLod) si.maxLod = si.minLod;
         if (g_nsamp_used >= NSAMP * 3 / 4) { VRED_ONCE("more than %d distinct samplers", NSAMP * 3 / 4); return g_samp[0].s; }
         if (vkCreateSampler(g_vk.dev, &si, NULL, &e->s)) { e->s = VK_NULL_HANDLE; VRED_ONCE("vkCreateSampler failed"); return VK_NULL_HANDLE; }
-        e->p = *sp; g_nsamp_used++;
+        e->p = *sp; g_nsamp_used++; e->custom = si.pNext != NULL; e->si = si; e->si.pNext = NULL; g_samp_last = e;
         return e->s;
     }
     return VK_NULL_HANDLE;
@@ -800,7 +843,8 @@ static int fmt_int_kind(VkFormat f, VkImageAspectFlags asp) {
     }
 }
 static int int_variants_on(void) { static int on = -1; if (on < 0) { const char *e = getenv("DM_VK_INT_VARIANTS"); on = !(e && e[0] == '0'); } return on; }   // 0: off (A/B)
-typedef struct sview { struct sview *next; uint64_t key; VkImageView v; VkFormat fmt; VkImageAspectFlags asp; } sview;
+typedef struct sview { struct sview *next; uint64_t key; VkImageView v; VkFormat fmt; VkImageAspectFlags asp; VkImageViewCreateInfo ci; } sview;
+static const sview *g_sv_last; static vk_tex *g_sv_x;   // the view sample_view gave last, and its texture (DM_VK_PS_DUMP)
 static VkFormat g_sv_fmt; static VkImageAspectFlags g_sv_asp;   // the format and aspect of the view sample_view last returned (stage_set's integer-slot test)
 static VkComponentSwizzle swz_vk(int s) { return s == NVN_SWZ_ZERO ? VK_COMPONENT_SWIZZLE_ZERO : s == NVN_SWZ_ONE ? VK_COMPONENT_SWIZZLE_ONE : (VkComponentSwizzle)(VK_COMPONENT_SWIZZLE_R + s - NVN_SWZ_R); }
 // The view a shader binding samples (or writes, storage) of a registered texture: its dimension from the shader, format and range from the NVN view, the channel
@@ -855,12 +899,12 @@ static VkImageView sample_view(vk_tex *x, const treg_t *r, const sbind *b, int s
     if (storage) memcpy(sw, (uint8_t[]){NVN_SWZ_R, NVN_SWZ_G, NVN_SWZ_B, NVN_SWZ_A}, 4);   // storage views take no remapping
     uint64_t key = (uint64_t)vt | (uint64_t)fmt << 4 | (uint64_t)base_l << 20 | (uint64_t)nl << 25 | (uint64_t)(base_y & 0x7ff) << 30 | (uint64_t)(ny & 0x7ff) << 41 |
                    ((uint64_t)(sw[0] | sw[1] << 3 | sw[2] << 6 | sw[3] << 9) << 52 ^ (uint64_t)asp << 62 ^ (uint64_t)storage << 63);
-    for (sview *c = x->sviews; c; c = c->next) if (c->key == key) { g_sv_fmt = c->fmt; g_sv_asp = c->asp; return c->v; }
+    for (sview *c = x->sviews; c; c = c->next) if (c->key == key) { g_sv_fmt = c->fmt; g_sv_asp = c->asp; g_sv_last = c; g_sv_x = x; return c->v; }
     VkImageViewUsageCreateInfo vu = {VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO, NULL, storage ? VK_IMAGE_USAGE_STORAGE_BIT : VK_IMAGE_USAGE_SAMPLED_BIT};
     VkImageViewCreateInfo vi = {VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, &vu, 0, x->img, vt, fmt, {swz_vk(sw[0]), swz_vk(sw[1]), swz_vk(sw[2]), swz_vk(sw[3])}, {asp, base_l, nl, base_y, ny}};
     VkImageView view;
     if (vkCreateImageView(g_vk.dev, &vi, NULL, &view)) { if (storage) { VRED_ONCE("storage view of texture %llu (format %d) failed", (unsigned long long)x->serial, fmt); return VK_NULL_HANDLE; } vi.format = x->fmt; if (vkCreateImageView(g_vk.dev, &vi, NULL, &view)) { VRED_ONCE("sampling view of texture %llu (format %d, view type %d) failed", (unsigned long long)x->serial, fmt, vt); return VK_NULL_HANDLE; } }
-    sview *c = malloc(sizeof *c); c->key = key; c->v = view; c->fmt = vi.format; c->asp = asp; g_sv_fmt = vi.format; g_sv_asp = asp; c->next = x->sviews; x->sviews = c;
+    sview *c = malloc(sizeof *c); c->key = key; c->v = view; c->fmt = vi.format; c->asp = asp; c->ci = vi; c->ci.pNext = NULL; g_sv_fmt = vi.format; g_sv_asp = asp; c->next = x->sviews; x->sviews = c; g_sv_last = c; g_sv_x = x;
     return view;
 }
 void vkd_tex_release(vk_tex *x) {
@@ -1493,6 +1537,89 @@ int vkd_clear_rect(VkRect2D *r, int *partial) {
 }
 static vk_tex *g_simg[8]; static int g_nsimg;   // a dispatch's storage images (stage_set), for its DM_VK_RING_STAGES snapshots
 static uint64_t g_n_sbuf_open;
+// ---------- DM_VK_PS_DUMP=<pixel shader key>: everything one draw reads, for running it again outside the game ----------
+// In a traced frame (the trace_now file), the first draw with that pixel shader has both stages' descriptor sets written out as Vulkan sees them: each buffer's bound
+// range, each sampled texture (every level and layer, with the image's, the view's and the sampler's create parameters), as $DM_ROOT/psdump.txt (one line per item)
+// and psdump.bin (the bytes). The copies are recorded before the draw, so they hold what the draw reads. The work folder's re/csrun/psrun_cap draws it again from these
+// through a chosen driver. For Fire Emblem Fortune's Weave's lighting draw (88d7f48d93663021), whose shadow edges are stepped with Turnip and smooth with Qualcomm's
+// driver while every compute shader of the frame gives both the same results
+enum { PSD_MAX = 160 << 20, PSD_TXT = 1 << 20 };
+typedef struct { uint32_t vb, elem; int storage, zero, zvt; vk_tex *x; VkImageViewCreateInfo vci; int has_s, custom; VkSamplerCreateInfo si; float bc[4]; } psd_img;
+static uint64_t g_psd_key; static int g_psd_on; static long long g_psd_done_at = -3;
+static psd_img g_psd_img[512]; static int g_psd_nimg;
+static VkBuffer g_psd_buf; static VkDeviceMemory g_psd_mem; static uint8_t *g_psd_map; static uint64_t g_psd_n; static char *g_psd_txt; static size_t g_psd_tn;
+static vk_tex *g_psd_tex[128]; static int g_psd_ntex;
+#define PSD(...) do { if (g_psd_tn + 600 < PSD_TXT) g_psd_tn += (size_t)snprintf(g_psd_txt + g_psd_tn, PSD_TXT - g_psd_tn, __VA_ARGS__); } while (0)
+static int psd_want(const shd *ps) {
+    static int init; if (!init) { init = 1; const char *e = getenv("DM_VK_PS_DUMP"); g_psd_key = e ? strtoull(e, NULL, 16) : 0; if (g_psd_key) VLOG("DM_VK_PS_DUMP: the inputs of the first draw of pixel shader %016llx in a traced frame go to psdump.txt / psdump.bin", (unsigned long long)g_psd_key); }
+    return g_psd_key && ps && ps->key == g_psd_key && tracing() && g_psd_done_at != g_trace_at;
+}
+static int psd_begin(void) {
+    if (!g_psd_buf) {
+        VkBufferCreateInfo bci = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, NULL, 0, PSD_MAX, VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, VK_SHARING_MODE_EXCLUSIVE};
+        if (vkCreateBuffer(g_vk.dev, &bci, NULL, &g_psd_buf)) { g_psd_buf = VK_NULL_HANDLE; return 0; }
+        VkMemoryRequirements mr; vkGetBufferMemoryRequirements(g_vk.dev, g_psd_buf, &mr);
+        VkMemoryAllocateInfo mai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, NULL, mr.size, g_vk.pool_type}; void *m = NULL;
+        if (vkAllocateMemory(g_vk.dev, &mai, NULL, &g_psd_mem) || vkBindBufferMemory(g_vk.dev, g_psd_buf, g_psd_mem, 0) || vkMapMemory(g_vk.dev, g_psd_mem, 0, VK_WHOLE_SIZE, 0, &m)) { VLOG("[RED] DM_VK_PS_DUMP: no buffer"); g_psd_buf = VK_NULL_HANDLE; return 0; }
+        g_psd_map = m; g_psd_txt = malloc(PSD_TXT);
+    }
+    g_psd_n = 0; g_psd_tn = 0; g_psd_ntex = 0; g_psd_nimg = 0; return g_psd_txt != NULL;
+}
+static void psd_note(const sbind *b, uint32_t k, int storage, int zeroed, const VkDescriptorImageInfo *d) {
+    if (g_psd_nimg >= 512) return;
+    psd_img *q = &g_psd_img[g_psd_nimg++]; memset(q, 0, sizeof *q); q->vb = b->vb; q->elem = k; q->storage = storage;
+    q->zvt = b->dim == 0 ? (b->arrayed ? VK_IMAGE_VIEW_TYPE_1D_ARRAY : VK_IMAGE_VIEW_TYPE_1D) : b->dim == 2 ? VK_IMAGE_VIEW_TYPE_3D : b->dim == 3 ? (b->arrayed ? VK_IMAGE_VIEW_TYPE_CUBE_ARRAY : VK_IMAGE_VIEW_TYPE_CUBE) : (b->arrayed ? VK_IMAGE_VIEW_TYPE_2D_ARRAY : VK_IMAGE_VIEW_TYPE_2D);
+    if (!d->imageView || zeroed || !g_sv_last || !g_sv_x) q->zero = d->imageView ? 1 : 2;   // 1: the host's zero view; 2: nothing bound
+    else { q->x = g_sv_x; q->vci = g_sv_last->ci; }
+    if (d->sampler && g_samp_last) { q->has_s = 1; q->si = g_samp_last->si; q->custom = g_samp_last->custom; memcpy(q->bc, g_samp_last->p.border, sizeof q->bc); }
+}
+static void psd_emit(sub_t *s, const shd *sh, const VkWriteDescriptorSet *wr, int nw) {
+    end_rendering(); barrier_all(s->cb);
+    PSD("SH %d %016llx imask %llx %llx\n", sh->stage, (unsigned long long)sh->key, (unsigned long long)sh->imask_u, (unsigned long long)sh->imask_s);
+    for (int i = 0; i < nw; i++) {
+        const VkWriteDescriptorSet *w = &wr[i];
+        if (w->descriptorType == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER || w->descriptorType == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER) {
+            const VkDescriptorBufferInfo *d = w->pBufferInfo; uint64_t n = d->range == VK_WHOLE_SIZE ? ((uint64_t)sh->c1n + 255) & ~255ull : d->range; long long at = -1;
+            if (d->buffer != g_zero && n && g_psd_n + n <= PSD_MAX) { VkBufferCopy bc = {d->offset, g_psd_n, n}; vkCmdCopyBuffer(s->cb, d->buffer, g_psd_buf, 1, &bc); at = (long long)g_psd_n; g_psd_n += (n + 15) & ~15ull; }
+            PSD("B %d %u %c size %llu at %lld%s\n", sh->stage, w->dstBinding, w->descriptorType == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER ? 'U' : 'S', (unsigned long long)n, at, d->buffer == g_zero ? " zero" : "");
+        } else for (uint32_t k = 0; k < w->descriptorCount; k++) {
+            const psd_img *q = NULL; for (int j = 0; j < g_psd_nimg && !q; j++) if (g_psd_img[j].vb == w->dstBinding && g_psd_img[j].elem == k) q = &g_psd_img[j];
+            if (!q) { PSD("I %d %u %u unknown\n", sh->stage, w->dstBinding, k); continue; }
+            char sm[400] = "nosamp";
+            if (q->has_s) snprintf(sm, sizeof sm, "samp %d %d %d %d %d %d %g %d %g %d %d %g %g %d custom %d %g %g %g %g", q->si.magFilter, q->si.minFilter, q->si.mipmapMode, q->si.addressModeU, q->si.addressModeV, q->si.addressModeW,
+                                  q->si.mipLodBias, q->si.anisotropyEnable, q->si.maxAnisotropy, q->si.compareEnable, q->si.compareOp, q->si.minLod, q->si.maxLod, q->si.borderColor, q->custom, q->bc[0], q->bc[1], q->bc[2], q->bc[3]);
+            char kind = q->storage ? 'X' : w->descriptorType == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER ? 'C' : 'T';
+            if (q->zero) { PSD("I %d %u %u %c zero %d vt %d %s\n", sh->stage, w->dstBinding, k, kind, q->zero, q->zvt, sm); continue; }
+            vk_tex *x = q->x; int known = 0; for (int j = 0; j < g_psd_ntex; j++) known |= g_psd_tex[j] == x;
+            if (!known && g_psd_ntex < 128) {
+                g_psd_tex[g_psd_ntex++] = x;
+                int dep = (x->aspect & VK_IMAGE_ASPECT_DEPTH_BIT) != 0; VkImageAspectFlags ca = dep ? VK_IMAGE_ASPECT_DEPTH_BIT : x->aspect;
+                PSD("X %llu type %d fmt %d w %u h %u d %u layers %u levels %u samples %d aspect %u copied %u bpb %d bw %d bh %d :", (unsigned long long)x->serial, x->type, x->fmt, x->w, x->h, x->depth, x->layers, x->levels, x->d.samples, x->aspect, ca,
+                    dep ? (x->fmt == VK_FORMAT_D16_UNORM ? 2 : 4) : x->bpb, dep ? 1 : x->bw, dep ? 1 : x->bh);
+                for (uint32_t l = 0; l < x->levels && x->d.samples <= 1 && !(ca & VK_IMAGE_ASPECT_STENCIL_BIT); l++) {
+                    uint32_t lw = level_dim(x->w, l), lh = level_dim(x->h, l), ld = level_dim(x->depth, l), bw = dep ? 1 : (uint32_t)x->bw, bh = dep ? 1 : (uint32_t)x->bh;
+                    uint64_t n = (uint64_t)((lw + bw - 1) / bw) * ((lh + bh - 1) / bh) * (dep ? (x->fmt == VK_FORMAT_D16_UNORM ? 2u : 4u) : (uint32_t)x->bpb) * ld * x->layers;
+                    if (!n || g_psd_n + n > PSD_MAX) { PSD(" L%u at -1 size %llu", l, (unsigned long long)n); continue; }
+                    VkBufferImageCopy c = {g_psd_n, 0, 0, {ca, l, 0, x->layers}, {0, 0, 0}, {lw, lh, ld}};
+                    vkCmdCopyImageToBuffer(s->cb, x->img, VK_IMAGE_LAYOUT_GENERAL, g_psd_buf, 1, &c);
+                    PSD(" L%u at %llu size %llu", l, (unsigned long long)g_psd_n, (unsigned long long)n); g_psd_n += (n + 15) & ~15ull;
+                }
+                PSD("\n");
+            }
+            PSD("I %d %u %u %c tex %llu view %d %d swz %d %d %d %d asp %u lv %u %u ly %u %u %s\n", sh->stage, w->dstBinding, k, kind, (unsigned long long)x->serial, q->vci.viewType, q->vci.format,
+                q->vci.components.r, q->vci.components.g, q->vci.components.b, q->vci.components.a, q->vci.subresourceRange.aspectMask, q->vci.subresourceRange.baseMipLevel, q->vci.subresourceRange.levelCount,
+                q->vci.subresourceRange.baseArrayLayer, q->vci.subresourceRange.layerCount, sm);
+        }
+    }
+    for (int i = 0; i < sh->nb; i++) if (sh->b[i].kind == BK_POOL_TEX || sh->b[i].kind == BK_POOL_SAMP) PSD("P %d %u pool array (not dumped)\n", sh->stage, sh->b[i].vb);
+    barrier_all(s->cb); g_psd_nimg = 0;
+}
+static void psd_write(void *arg) {   // once the GPU has made the copies (vkx_defer)
+    (void)arg; char q[700]; const char *root = getenv("DM_ROOT") ? getenv("DM_ROOT") : ".";
+    snprintf(q, sizeof q, "%s/psdump.txt", root); FILE *f = fopen(q, "w"); if (f) { fwrite(g_psd_txt, 1, g_psd_tn, f); fclose(f); }
+    snprintf(q, sizeof q, "%s/psdump.bin", root); f = fopen(q, "wb"); if (f) { fwrite(g_psd_map, 1, g_psd_n, f); fclose(f); }
+    VLOG("DM_VK_PS_DUMP: %llu bytes and %llu bytes of index written to %s/psdump.bin / .txt", (unsigned long long)g_psd_n, (unsigned long long)g_psd_tn, root);
+}
 static int sbuf_open_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_VK_SBUF_EXACT"); v = !(e && e[0] == '1'); VLOG("storage buffers are bound %s", v ? "up to 1 MB past their size (their pool's end at most): a read past the size returns the memory there, as on the console" : "at their size only (DM_VK_SBUF_EXACT=1)"); } return v; }
 static int stage_set(sub_t *s, shd *sh, VkDescriptorSet *out, int *missing_tex) {
     if (!sh->nb) { *out = VK_NULL_HANDLE; return 1; }
@@ -1598,6 +1725,7 @@ static int stage_set(sub_t *s, shd *sh, VkDescriptorSet *out, int *missing_tex) 
             int storage = b->dt == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
             for (uint32_t k = 0; k < n; k++) {
                 VkDescriptorImageInfo *d = &ii[nii++]; *d = (VkDescriptorImageInfo){VK_NULL_HANDLE, VK_NULL_HANDLE, VK_IMAGE_LAYOUT_GENERAL};
+                if (g_psd_on) { g_sv_last = NULL; g_sv_x = NULL; g_samp_last = NULL; }
                 int tid = 0, sid = 0, zeroed = 0; treg_t r; samp_par sp;
                 if (b->kind == BK_TEX || b->kind == BK_IMG) binding_ids(stage, b, k, &tid, &sid);
                 if (g_hstale_hit) {   // the handle came from memory a dispatch earlier in this submission writes, before the GPU ran it
@@ -1650,8 +1778,9 @@ static int stage_set(sub_t *s, shd *sh, VkDescriptorSet *out, int *missing_tex) 
                     d->imageView = vkx_zero_view(zvt); if (d->imageView) zeroed = 1;   // a null descriptor here reads as one flat colour
                 }
                 if (!d->imageView) (*missing_tex)++;
-                TRACE("  st%d b%u %s dim %d arr %d kind %d cbs %d handle %#x [%u]: tid %d sid %d reg %d ser %llu %ux%u fmt %#x tgt %d mem %p -> view %s", stage, b->vb, storage ? "storage image" : "texture", b->dim, b->arrayed, b->kind, b->cbs, (unsigned)b->handle, k, tid, sid,
-                      tid ? treg_get(tid, &r) : 0, tid && treg_get(tid, &r) ? (unsigned long long)r.t.serial : 0ull, tid && treg_get(tid, &r) ? r.t.d.width : 0, tid && treg_get(tid, &r) ? r.t.d.height : 0,
+                if (g_psd_on) psd_note(b, k, storage, zeroed, d);
+                TRACE("  st%d b%u %s dim %d arr %d kind %d cbs %d handle %#x [%u]: tid %d sid %d reg %d ser %llu %ux%ux%u fmt %#x tgt %d mem %p -> view %s", stage, b->vb, storage ? "storage image" : "texture", b->dim, b->arrayed, b->kind, b->cbs, (unsigned)b->handle, k, tid, sid,
+                      tid ? treg_get(tid, &r) : 0, tid && treg_get(tid, &r) ? (unsigned long long)r.t.serial : 0ull, tid && treg_get(tid, &r) ? r.t.d.width : 0, tid && treg_get(tid, &r) ? r.t.d.height : 0, tid && treg_get(tid, &r) ? r.t.d.depth : 0,
                       tid && treg_get(tid, &r) ? r.t.d.format : 0, tid && treg_get(tid, &r) ? r.t.d.target : -1, tid && treg_get(tid, &r) ? (void *)r.t.mem : NULL, d->imageView ? (zeroed ? "zero" : "ok") : "none");
                 if (have_sp) TRACE("    sampler %d: filter min %d mag %d, wrap %d %d %d, compare %d/%d, lod %.2f to %.2f bias %.2f, aniso %.1f, border %.3f %.3f %.3f %.3f", sid, sp.minf, sp.magf, sp.ws, sp.wt, sp.wr,
                                    sp.cmp_mode, sp.cmp_func, (double)sp.lod_min, (double)sp.lod_max, (double)sp.lod_bias, (double)sp.aniso, (double)sp.border[0], (double)sp.border[1], (double)sp.border[2], (double)sp.border[3]);
@@ -1691,6 +1820,7 @@ static int stage_set(sub_t *s, shd *sh, VkDescriptorSet *out, int *missing_tex) 
         free(pw); free(pi);
     }
     for (int i = 0; i < ncsw_new; i++) csw_add(csw_new[0][i], csw_new[1][i]);
+    if (g_psd_on) psd_emit(s, sh, wr, nw);
     *out = ds;
     return 1;
 }
@@ -1759,7 +1889,10 @@ void vkd_draw(sub_t *s, uint32_t op, const void *rec, uint32_t size) {
     }
     // resources first: uploads end the render pass, which must be open for the draw
     VkDescriptorSet sets[3] = {0}; int missing = 0;
-    if (!stage_set(s, vs, &sets[0], &missing) || (ps && !stage_set(s, ps, &sets[1], &missing)) || (gs && !stage_set(s, gs, &sets[2], &missing))) { g_n_skip_other++; return; }
+    g_psd_on = psd_want(ps) && psd_begin();
+    { int ok_sets = stage_set(s, vs, &sets[0], &missing) && (!ps || stage_set(s, ps, &sets[1], &missing)) && (!gs || stage_set(s, gs, &sets[2], &missing));
+      if (g_psd_on) { g_psd_on = 0; g_psd_done_at = g_trace_at; vkx_defer(psd_write, NULL); }
+      if (!ok_sets) { g_n_skip_other++; return; } }
     if (missing) g_n_missing_tex += (uint64_t)missing;
     g_rt.want = (VkExtent2D){S.has_vp && S.vp[2] >= 1 ? (uint32_t)(S.vp[0] + S.vp[2]) : 0, S.has_vp && S.vp[3] >= 1 ? (uint32_t)(S.vp[1] + S.vp[3]) : 0};
     if (!g_rt.want.height) g_rt.want.width = 0;

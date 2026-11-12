@@ -70,7 +70,8 @@ static void grave_collect(uint64_t applied) {
     pthread_mutex_unlock(&g_grave_mu);
 }
 uint64_t g_stats_draws; static uint64_t g_stats_passes, g_stats_uploads, g_stats_clears, g_stats_copies;
-static _Atomic uint64_t g_img_bytes, g_img_live;
+static _Atomic uint64_t g_img_bytes, g_img_live, g_img_made, g_img_made_b; static _Atomic int64_t g_defer_b; static _Atomic uint64_t g_mem_frame;
+void vkx_defer_bytes(int64_t d) { atomic_fetch_add(&g_defer_b, d); }
 static uint64_t g_n_evict, g_n_unevict, g_evict_bytes;   // tex_evict: images given up, made again, and the bytes given up   // the host's texture images (tex_create / tex_free_gpu), for the memory line
 // The memory line (every 600 frames): what Android's low-memory killer weighs. The process from /proc/self/status, the GPU driver's own count (kgsl), the host's images and kept
 // SPIR-V, and what the system has left. Fortune's Weave was killed for low memory after its tutorial (exit reason 3, importance 100) at about 5.3 GB
@@ -81,15 +82,29 @@ static long kb_of(const char *path, const char *key) {   // a "Key: N kB" line's
     fclose(f); return v;
 }
 static void img_split(uint64_t *owned, uint64_t *cpu);
-static void mem_line(uint64_t n) {
+static void mem_line(uint64_t n, const char *why) {
     char p1[96], p2[96]; snprintf(p1, sizeof p1, "/sys/class/kgsl/kgsl/proc/%d/gpumem_mapped", (int)getpid()); snprintf(p2, sizeof p2, "/sys/class/kgsl/kgsl/proc/%d/gpumem_unmapped", (int)getpid());
     long rss = kb_of("/proc/self/status", "VmRSS"), anon = kb_of("/proc/self/status", "RssAnon"), shm = kb_of("/proc/self/status", "RssShmem"), swp = kb_of("/proc/self/status", "VmSwap");
     long gm = kb_of(p1, NULL), gu = kb_of(p2, NULL), avail = kb_of("/proc/meminfo", "MemAvailable");
-    uint64_t own, cpu; img_split(&own, &cpu);
-    VLOG("[mem] frame %llu: process RSS %ld MB (anon %ld, shared %ld, swapped %ld); GPU driver mapped %ld + unmapped %ld MB; host images %llu MB (%llu live; GPU-written %llu MB, CPU content %llu MB; evicted %llu, %llu MB, made again %llu), arenas %llu MB, kept SPIR-V %llu MB; system available %ld MB",
+    uint64_t own, cpu; img_split(&own, &cpu); uint64_t pa, pab, pd, pdb; vk_pool_churn(&pa, &pab, &pd, &pdb);
+    VLOG("[mem] frame %llu: process RSS %ld MB (anon %ld, shared %ld, swapped %ld); GPU driver mapped %ld + unmapped %ld MB; host images %llu MB (%llu live; GPU-written %llu MB, CPU content %llu MB; evicted %llu, %llu MB, made again %llu), arenas %llu MB, kept SPIR-V %llu MB; system available %ld MB; since start: images made %llu (%llu MB), pools on %llu (%llu MB) / released %llu (%llu MB); frees waiting for the GPU %d, %lld MB%s",
          (unsigned long long)n, rss / 1024, anon / 1024, shm / 1024, swp / 1024, gm / 1024, gu / 1024, (unsigned long long)(atomic_load(&g_img_bytes) >> 20), (unsigned long long)atomic_load(&g_img_live), (unsigned long long)(own >> 20), (unsigned long long)(cpu >> 20), (unsigned long long)g_n_evict, (unsigned long long)(g_evict_bytes >> 20), (unsigned long long)g_n_unevict,
          (unsigned long long)(vkd_arena_bytes() >> 20),
-         (unsigned long long)(vkd_words_bytes() >> 20), avail / 1024);
+         (unsigned long long)(vkd_words_bytes() >> 20), avail / 1024, (unsigned long long)atomic_load(&g_img_made), (unsigned long long)(atomic_load(&g_img_made_b) >> 20), (unsigned long long)pa, (unsigned long long)(pab >> 20), (unsigned long long)pd, (unsigned long long)(pdb >> 20), g_ngrave, (long long)(atomic_load(&g_defer_b) >> 20), why);
+}
+// The memory line between its 600-frame turns: a thread reads the system's available memory four times a second and writes the line when it has fallen 300 MB below the
+// last line's figure, or sits under 1.5 GB and has moved 100 MB (or 10 s have passed). Fortune's Weave was killed for low memory 17 s after a line that showed 4.8 GB
+// left, with no frame count reaching the next one (DM_VK_MEM_WATCH=0 off)
+static uint64_t now_ns_mono(void);
+static void *mem_watch(void *arg) {
+    (void)arg; long last = kb_of("/proc/meminfo", "MemAvailable") / 1024; uint64_t t_last = now_ns_mono();
+    for (;;) {
+        usleep(250000);
+        long a = kb_of("/proc/meminfo", "MemAvailable") / 1024; uint64_t now = now_ns_mono(); long d = a - last; if (d < 0) d = -d;
+        if (last - a >= 300 || (a < 1500 && (d >= 100 || now - t_last > 10000000000ull))) { mem_line(atomic_load(&g_mem_frame), " (watch)"); last = a; t_last = now; }
+        else if (a > last) last = a;   // recovered: the next fall is measured from here
+    }
+    return NULL;
 }
 
 
@@ -204,6 +219,7 @@ static int exec_init(void) {
     if (vkCreateSemaphore(g_vk.dev, &si, NULL, &g_sem)) { VLOG("[RED] timeline semaphore failed"); return 0; }
     pthread_t th; if (pthread_create(&th, NULL, completion_thread, NULL)) return 0;
     pthread_detach(th);
+    { const char *e = getenv("DM_VK_MEM_WATCH"); pthread_t mw; if (!(e && *e == '0') && !pthread_create(&mw, NULL, mem_watch, NULL)) pthread_detach(mw); }
     g_exec_ok = 1;
     VLOG("executor on: submissions numbered by a timeline semaphore, %d command buffers", NSUB);
     return 1;
@@ -396,7 +412,7 @@ static int tex_create(vk_tex *x, VkCommandBuffer cb) {
     VkMemoryAllocateInfo mai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, NULL, mr.size, device_local_type(mr.memoryTypeBits)};
     if ((r = vkAllocateMemory(g_vk.dev, &mai, NULL, &x->dm)) || (r = vkBindImageMemory(g_vk.dev, x->img, x->dm, 0))) {
         x->failed = 1; VLOG("[RED] texture memory %d (%llu bytes)", r, (unsigned long long)mr.size); vkDestroyImage(g_vk.dev, x->img, NULL); x->img = VK_NULL_HANDLE; return 0; }
-    x->dbytes = mr.size; atomic_fetch_add(&g_img_bytes, mr.size); atomic_fetch_add(&g_img_live, 1);
+    x->dbytes = mr.size; atomic_fetch_add(&g_img_bytes, mr.size); atomic_fetch_add(&g_img_live, 1); atomic_fetch_add(&g_img_made, 1); atomic_fetch_add(&g_img_made_b, mr.size);
     VkImageMemoryBarrier ib = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, NULL, 0, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
                                VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, x->img, {x->aspect, 0, VK_REMAINING_MIP_LEVELS, 0, VK_REMAINING_ARRAY_LAYERS}};
     end_rendering();   // a texture first seen while a draw gathers its resources: barriers are not allowed inside the render pass
@@ -423,6 +439,7 @@ vk_tex *tex_of(const tex_t *t, VkCommandBuffer cb) {
 }
 static void tex_free_gpu(void *arg) {
     vk_tex *x = arg;
+    atomic_fetch_sub(&g_defer_b, (int64_t)x->fbytes);
     if (x->img) { vkd_tex_release(x); vkDestroyImage(g_vk.dev, x->img, NULL); vkFreeMemory(g_vk.dev, x->dm, NULL); atomic_fetch_sub(&g_img_bytes, x->dbytes); atomic_fetch_sub(&g_img_live, 1); }
     free(x);
 }
@@ -443,7 +460,7 @@ static void tex_evict(void) {
         *dead = *x; dead->next = NULL;   // the image, its memory and its views go once the GPU can no longer use them (tex_free_gpu)
         x->img = VK_NULL_HANDLE; x->dm = VK_NULL_HANDLE; x->sviews = NULL; x->dbytes = 0; x->uploaded = 0; x->dirty = 1; x->lin_sub = 0;
         bytes += dead->dbytes; n++;
-        vkx_defer(tex_free_gpu, dead);
+        dead->fbytes = dead->dbytes; atomic_fetch_add(&g_defer_b, (int64_t)dead->fbytes); vkx_defer(tex_free_gpu, dead);
     }
     pthread_mutex_unlock(&g_tex_mu);
     g_n_evict += (uint64_t)n; g_evict_bytes += bytes;
@@ -471,7 +488,7 @@ vk_tex *vkx_clone(sub_t *s, vk_tex *x, int keep) {
     barrier_all(s->cb);
     vkCmdCopyImage(s->cb, x->img, VK_IMAGE_LAYOUT_GENERAL, c->img, VK_IMAGE_LAYOUT_GENERAL, n, rg);
     barrier_all(s->cb);
-    if (!keep) vkx_defer(tex_free_gpu, c);
+    if (!keep) { c->fbytes = c->dbytes; atomic_fetch_add(&g_defer_b, (int64_t)c->fbytes); vkx_defer(tex_free_gpu, c); }
     return c;
 }
 void mtl_tex_release(tex_t *t) {
@@ -481,7 +498,7 @@ void mtl_tex_release(tex_t *t) {
     while (*b && (*b)->serial != t->serial) b = &(*b)->next;
     vk_tex *x = *b; if (x) *b = x->next;
     pthread_mutex_unlock(&g_tex_mu);
-    if (x) vkx_defer(tex_free_gpu, x);   // the submission being recorded may still use it: destroyed once the GPU is done
+    if (x) { x->fbytes = x->dbytes; atomic_fetch_add(&g_defer_b, (int64_t)x->fbytes); vkx_defer(tex_free_gpu, x); }   // the submission being recorded may still use it: destroyed once the GPU is done
 }
 void mtl_tex_cpu_written(const tex_t *t) {
     if (!t || !t->serial) return;
@@ -1267,7 +1284,7 @@ static uint32_t depth_bpp(VkFormat f) { return f == VK_FORMAT_D16_UNORM ? 2 : 4;
 // index line per buffer; saved as f<frame>_cs.bin and f<frame>_cs.txt. The copies run on the GPU right after the dispatch, so inputs and outputs are what that dispatch
 // saw and wrote: the dispatch can then be run again on a PC with the same inputs (the work folder's re/csrun) and its outputs compared. For Fire Emblem Fortune's Weave's
 // light culling (35d12d6f98fa05e2), whose shaders give a PC's results on the Adreno with generated inputs while battles tear once it writes its results
-enum { CSD_MAX = 40 << 20, CSD_PART = 2 << 20, CSD_IDX = 65536 };
+enum { CSD_MAX = 48 << 20, CSD_PART = 16 << 20, CSD_IDX = 65536 };   // a part was 2 MB until the light lists of Fortune's Weave (9.4 MB) had to be whole
 void vkx_ring_csdump(sub_t *s, uint64_t key, int x, int y, int z, const p_bind_buf *ubo, const p_bind_buf *ssbo) {
     static const char *want; static int init; if (!init) { init = 1; want = getenv("DM_VK_RING_CS"); if (want && ring_on()) VLOG("DM_VK_RING_CS: buffers of dispatches of %s kept with the ring, %d MB a frame at most", want, CSD_MAX >> 20); }
     vkx_ring_csdump2(s, want, key, x, y, z, ubo, ssbo);
@@ -1297,18 +1314,19 @@ void vkx_ring_csdump2(sub_t *s, const char *want, uint64_t key, int x, int y, in
 // pass that drew into it and after each compute dispatch that wrote it as a storage image, in order, labelled (what, texture, size, format, guest address) and marked
 // in the draw list ("STAGE n"); saved beside the scene as f<frame>_s<nn>.png and f<frame>_stages.txt. Comparing a bad frame with the good one before it, the first
 // snapshot that differs is the step that broke. Texture uploads are noted too ("UPLOAD"), with any GPU-written image over the same guest memory
-static int g_stg = -1; static const uint32_t g_stg_w = 160, g_stg_h = 90;
+static float g_stg_r[4] = {0, 0, 1, 1};   // DM_VK_RING_STAGE_RECT=x0,y0,x1,y1 (fractions of the image): the snapshots show that part only, at the proven 160x90
+static int g_stg = -1; static uint32_t g_stg_w = 160, g_stg_h = 90;   // DM_VK_RING_STAGE_W=<width> (160 to 960, 16:9): larger snapshots, for a fault of a few pixels (112 a frame: 310 MB a kept frame at 640). Images smaller than the snapshot are left out: enlarging a 256x256 one hung Turnip (device lost) in the title screen
 static VkImage g_stg_img; static VkDeviceMemory g_stg_imem; static uint64_t g_stg_n, g_stg_skip;
 static int g_stg_hdr; static VkImage g_stg_img16; static VkDeviceMemory g_stg_imem16;   // DM_VK_RING_STAGES=2: each colour snapshot also as 16-bit float (f<frame>_s<nn>.f16, 160x90 RGBA half floats), since the 8-bit
                                                                                          // one clips everything above 1 and a lit scene before tone mapping is all above 1 (the world map's dark triangle, logs_mem3/001253)
 
 static int stages_on(void) {
-    if (g_stg < 0) { const char *e = getenv("DM_VK_RING_STAGES"); g_stg = ring_on() && e && (e[0] == '1' || e[0] == '2'); g_stg_hdr = g_stg && e[0] == '2'; if (g_stg) VLOG("DM_VK_RING_STAGES: %d snapshots of %ux%u a frame at most, kept with the ring", STG_MAX, g_stg_w, g_stg_h); }
+    if (g_stg < 0) { const char *e = getenv("DM_VK_RING_STAGES"); g_stg = ring_on() && e && (e[0] == '1' || e[0] == '2'); g_stg_hdr = g_stg && e[0] == '2'; { const char *q = getenv("DM_VK_RING_STAGE_RECT"); float v[4]; if (q && sscanf(q, "%f,%f,%f,%f", &v[0], &v[1], &v[2], &v[3]) == 4 && v[0] >= 0 && v[1] >= 0 && v[2] <= 1 && v[3] <= 1 && v[2] > v[0] && v[3] > v[1]) memcpy(g_stg_r, v, sizeof v); } { const char *w = getenv("DM_VK_RING_STAGE_W"); int v = w ? atoi(w) : 0; if (v >= 160 && v <= 960) { g_stg_w = (uint32_t)v & ~15u; g_stg_h = g_stg_w * 9 / 16; } } if (g_stg) VLOG("DM_VK_RING_STAGES: %d snapshots of %ux%u a frame at most, kept with the ring", STG_MAX, g_stg_w, g_stg_h); }
     return g_stg;
 }
 // one snapshot of x into the slot the current frame fills; outside a render pass (callers: end_rendering, after a dispatch)
 void vkx_stage_snap(sub_t *s, vk_tex *x, const char *what) {
-    if (!stages_on() || !s || !x || !x->img || x->type != VK_IMAGE_TYPE_2D || x->d.samples > 1 || x->w < 256 || x->w >= 1920 || !(x->aspect & VK_IMAGE_ASPECT_COLOR_BIT)) return;   // the 3D passes (960x540 in battles at low dynamic resolution) and their half / quarter companions; not the UI and upscaled output (1920 and up)
+    if (!stages_on() || !s || !x || !x->img || x->type != VK_IMAGE_TYPE_2D || x->d.samples > 1 || x->w < 256 || x->w * (g_stg_r[2] - g_stg_r[0]) < g_stg_w || x->h * (g_stg_r[3] - g_stg_r[1]) < g_stg_h || x->w >= 1920 || !(x->aspect & VK_IMAGE_ASPECT_COLOR_BIT)) return;   // the 3D passes (960x540 in battles at low dynamic resolution) and their half / quarter companions; not the UI and upscaled output (1920 and up)
     ring_slot *r = &g_ring[g_ring_i % g_ring_n];
     if (r->sfill != g_ring_i + 1) { r->sfill = g_ring_i + 1; r->sn = 0; }
     if (r->sn >= STG_MAX) { g_stg_skip++; return; }
@@ -1328,7 +1346,7 @@ void vkx_stage_snap(sub_t *s, vk_tex *x, const char *what) {
         vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1, &ib);
     }
     barrier_all(cb);
-    VkImageBlit bl = {{VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {{0, 0, 0}, {(int32_t)x->w, (int32_t)x->h, 1}}, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {{0, 0, 0}, {(int32_t)g_stg_w, (int32_t)g_stg_h, 1}}};
+    VkImageBlit bl = {{VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {{(int32_t)(x->w * g_stg_r[0]), (int32_t)(x->h * g_stg_r[1]), 0}, {(int32_t)(x->w * g_stg_r[2]), (int32_t)(x->h * g_stg_r[3]), 1}}, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {{0, 0, 0}, {(int32_t)g_stg_w, (int32_t)g_stg_h, 1}}};
     vkCmdBlitImage(cb, x->img, VK_IMAGE_LAYOUT_GENERAL, g_stg_img, VK_IMAGE_LAYOUT_GENERAL, 1, &bl, VK_FILTER_LINEAR);
     barrier_all(cb);
     VkBufferImageCopy c = {(VkDeviceSize)r->sn * g_stg_w * g_stg_h * 4, 0, 0, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, 0, 0}, {g_stg_w, g_stg_h, 1}};
@@ -1364,7 +1382,7 @@ void vkx_stage_snap(sub_t *s, vk_tex *x, const char *what) {
 static VkBuffer g_dsb; static VkDeviceMemory g_dsbm; static uint64_t g_dsb_size;
 static struct { VkImage img; VkDeviceMemory mem; uint32_t w, h; } g_dsi[4]; static int g_dsi_n;
 void vkx_stage_snap_depth(sub_t *s, vk_tex *x, const char *what) {
-    if (!stages_on() || !s || !x || !x->img || x->type != VK_IMAGE_TYPE_2D || x->d.samples > 1 || x->w < 256 || x->w >= 1920) return;
+    if (!stages_on() || !s || !x || !x->img || x->type != VK_IMAGE_TYPE_2D || x->d.samples > 1 || x->w < 256 || x->w * (g_stg_r[2] - g_stg_r[0]) < g_stg_w || x->h * (g_stg_r[3] - g_stg_r[1]) < g_stg_h || x->w >= 1920) return;
     if (x->fmt != VK_FORMAT_D32_SFLOAT && x->fmt != VK_FORMAT_D32_SFLOAT_S8_UINT) { vkx_ring_note("STAGE - depth %s tex %llu fmt %d: not 32-bit float", what, (unsigned long long)x->serial, x->fmt); return; }
     ring_slot *r = &g_ring[g_ring_i % g_ring_n];
     if (r->sfill != g_ring_i + 1) { r->sfill = g_ring_i + 1; r->sn = 0; }
@@ -1418,7 +1436,7 @@ void vkx_stage_snap_depth(sub_t *s, vk_tex *x, const char *what) {
     VkBufferImageCopy c2 = {0, 0, 0, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, 0, 0}, {x->w, x->h, 1}};
     vkCmdCopyBufferToImage(cb, g_dsb, g_dsi[k].img, VK_IMAGE_LAYOUT_GENERAL, 1, &c2);
     barrier_all(cb);
-    VkImageBlit bl = {{VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {{0, 0, 0}, {(int32_t)x->w, (int32_t)x->h, 1}}, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {{0, 0, 0}, {(int32_t)g_stg_w, (int32_t)g_stg_h, 1}}};
+    VkImageBlit bl = {{VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {{(int32_t)(x->w * g_stg_r[0]), (int32_t)(x->h * g_stg_r[1]), 0}, {(int32_t)(x->w * g_stg_r[2]), (int32_t)(x->h * g_stg_r[3]), 1}}, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {{0, 0, 0}, {(int32_t)g_stg_w, (int32_t)g_stg_h, 1}}};
     vkCmdBlitImage(cb, g_dsi[k].img, VK_IMAGE_LAYOUT_GENERAL, g_stg_img, VK_IMAGE_LAYOUT_GENERAL, 1, &bl, VK_FILTER_NEAREST);
     barrier_all(cb);
     VkBufferImageCopy c3 = {(VkDeviceSize)r->sn * g_stg_w * g_stg_h * 4, 0, 0, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, 0, 0}, {g_stg_w, g_stg_h, 1}};
@@ -1678,7 +1696,8 @@ uint64_t mtl_present(const tex_t *t, double period_s, const int crop[4]) {
     if (n % 150 == 0 && g_exec_ok == 1) tex_evict();
     if (g_exec_ok == 1) ring_save_check(n);
     if (g_exec_ok == 1) prof_frame(n);
-    if (n % 600 == 0 && g_exec_ok == 1) mem_line(n);
+    atomic_store(&g_mem_frame, n);
+    if (n % 600 == 0 && g_exec_ok == 1) mem_line(n, "");
     if (n % 600 == 0 && g_exec_ok == 1) { uint64_t sh, dr; vkd_front_stats(&sh, &dr); if (sh || dr) VLOG("frame %llu: %llu frames shown on the app's screen, %llu dropped (the app was behind)", (unsigned long long)n, (unsigned long long)sh, (unsigned long long)dr); }
     if (n % 600 == 0 && g_exec_ok == 1) VLOG("frame %llu: clears applied as load operations %llu, passes that only clear %llu (DM_VK_LOAD_CLEAR); depth clears that waited for their image's pass %llu: %llu its load operation, %llu landed alone (DM_VK_WAIT_CLEAR); ClearTexture of depth images %llu as load operations, %llu as transfer clears; early-depth kicks %llu (%llu passes without one)", (unsigned long long)n, (unsigned long long)g_n_load_clear, (unsigned long long)g_n_clear_only_pass, (unsigned long long)g_n_wait, (unsigned long long)g_n_wait_used, (unsigned long long)g_n_wait_landed, (unsigned long long)g_n_ct_depth, (unsigned long long)g_n_ct_depth_xfer, (unsigned long long)g_n_lrz_kick, (unsigned long long)g_n_lrz_skip);
     if (n % 600 == 0 && g_exec_ok == 1) VLOG("frame %llu: %llu render passes, %llu clears, %llu copies, %llu uploads, %llu draws so far (%s)", (unsigned long long)n,

@@ -36,6 +36,7 @@ typedef struct vk_tex {
     uint64_t lin_sub;                                     // a linear texture: the submission that last copied it from its pool (re-copied once per submission)
     uint64_t nclear, ncopy, ndraw; float last_clear[4];   // what the GPU did to it (frame-shot diagnostics)
     void *sviews;                                         // the draw path's cached sampling views (nvn_vk_draw.c), destroyed with the texture
+    uint64_t fbytes;                                      // counted as a free waiting for the GPU (tex_free_gpu takes it off again)
     uint64_t dbytes;                                      // its image's device memory (the memory line's host-image total)
     uint64_t last_ns;                                     // when a recording last looked it up (tex_of): idle images of CPU content are evicted (tex_evict)
     uint8_t wd, ws; float wdv; uint32_t wsv, wl, wy;      // a depth / stencil clear of the whole image (level wl, layer wy) waiting for the image's next pass (nvn_vk_exec.c wait_*)

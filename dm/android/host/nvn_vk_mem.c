@@ -12,6 +12,7 @@
 // DM_VK_POOLS=0 leaves pools in ordinary memory (the null backend's behaviour).
 #include <errno.h>
 #include <pthread.h>
+#include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -84,6 +85,7 @@ static void vk_init_once(void) {
     VkPhysicalDeviceVulkan12Features f12 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES, &f13};
     f12.timelineSemaphore = h12.timelineSemaphore; f12.shaderFloat16 = h12.shaderFloat16; f12.shaderInt8 = h12.shaderInt8; f12.scalarBlockLayout = h12.scalarBlockLayout;
     f12.descriptorIndexing = h12.descriptorIndexing; f12.runtimeDescriptorArray = h12.runtimeDescriptorArray; f12.descriptorBindingPartiallyBound = h12.descriptorBindingPartiallyBound;
+    f12.shaderSampledImageArrayNonUniformIndexing = h12.shaderSampledImageArrayNonUniformIndexing; g_vk.nonuniform = h12.shaderSampledImageArrayNonUniformIndexing;
     {   // the Vulkan memory model, only when frame generation is on (DM_LSFG=1: the Lossless shaders need it, lsfg_glue.cpp). Turned on for every run it was
         // the one device change before Fire Emblem Fortune's Weave's light culling went wrong in a triangle of tiles on the world map (logs_mem3/001253): kept off otherwise
         const char *lf = getenv("DM_LSFG"); int want = lf && lf[0] == '1';
@@ -202,8 +204,10 @@ static int pool_back(vk_pool *o) {
     if ((r = vkBindBufferMemory(g_vk.dev, o->buf, o->dm, 0))) VLOG("[RED] pool %p: vkBindBufferMemory %d", (void *)o->mem, r);
     return 0;
 }
+static _Atomic uint64_t g_pool_adds, g_pool_add_b, g_pool_dels, g_pool_del_b;   // pools put on the GPU and released, and their bytes (cumulative; the memory line)
+void vk_pool_churn(uint64_t *adds, uint64_t *add_b, uint64_t *dels, uint64_t *del_b) { *adds = atomic_load(&g_pool_adds); *add_b = atomic_load(&g_pool_add_b); *dels = atomic_load(&g_pool_dels); *del_b = atomic_load(&g_pool_del_b); }
 static void pool_free_gpu(void *arg) {
-    vk_pool *o = arg;
+    vk_pool *o = arg; vkx_defer_bytes(-(int64_t)o->size);
     vkDestroyBuffer(g_vk.dev, o->buf, NULL);
     vkUnmapMemory(g_vk.dev, o->dm); vkFreeMemory(g_vk.dev, o->dm, NULL);
     free(o);
@@ -221,7 +225,7 @@ static void pool_unback(vk_pool *o) {
     static int leak = -1; if (leak < 0) leak = getenv("DM_VK_POOL_LEAK") != NULL;   // diagnostic: the GPU side is never freed
     VLOG("pool %p+%#llx released at submission %llu%s", (void *)o->mem, (unsigned long long)o->size, (unsigned long long)__atomic_load_n(&g_fence, __ATOMIC_ACQUIRE), leak ? " (GPU side kept: DM_VK_POOL_LEAK)" : "");
     if (leak) return;
-    vk_pool *dead = malloc(sizeof *dead); *dead = *o;
+    vk_pool *dead = malloc(sizeof *dead); *dead = *o; vkx_defer_bytes((int64_t)o->size);
     vkx_defer(pool_free_gpu, dead);
 }
 
@@ -232,7 +236,7 @@ void vk_pool_add(const void *mem, uint64_t size) {
     pthread_rwlock_wrlock(&g_pools_mu);
     if (g_npools == g_cpools) { g_cpools = g_cpools ? g_cpools * 2 : 64; g_pools = realloc(g_pools, (size_t)g_cpools * sizeof *g_pools); }
     int i = g_npools; while (i > 0 && g_pools[i - 1].mem > o.mem) { g_pools[i] = g_pools[i - 1]; i--; }   // sorted by address
-    g_pools[i] = o; g_npools++; g_pool_bytes += size;
+    g_pools[i] = o; g_npools++; g_pool_bytes += size; atomic_fetch_add(&g_pool_adds, 1); atomic_fetch_add(&g_pool_add_b, size);
     int n = g_npools; uint64_t total = g_pool_bytes;
     pthread_rwlock_unlock(&g_pools_mu);
     if (n <= 8 || !(n & (n - 1))) VLOG("pool %p+%#llx on the GPU (%d pools, %.1f MB)", mem, (unsigned long long)size, n, total / 1048576.0);
@@ -242,7 +246,7 @@ void vk_pool_del(const void *mem) {
     pthread_rwlock_wrlock(&g_pools_mu);
     for (int i = 0; i < g_npools; i++) if (g_pools[i].mem == mem) { o = g_pools[i]; memmove(&g_pools[i], &g_pools[i + 1], (size_t)(g_npools - i - 1) * sizeof *g_pools); g_npools--; g_pool_bytes -= o.size; found = 1; break; }
     pthread_rwlock_unlock(&g_pools_mu);
-    if (found) pool_unback(&o);   // no vkQueueWaitIdle here: the queue belongs to the submitting thread (unsynchronized use lost the device)
+    if (found) { atomic_fetch_add(&g_pool_dels, 1); atomic_fetch_add(&g_pool_del_b, o.size); pool_unback(&o); }  // no vkQueueWaitIdle here: the queue belongs to the submitting thread (unsynchronized use lost the device)
 }
 // The pool holding [addr, addr + len): its buffer and the offset in it
 int vk_pool_find(uint64_t addr, uint64_t len, VkBuffer *buf, uint64_t *off) {

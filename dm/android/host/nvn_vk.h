@@ -17,6 +17,7 @@ typedef struct {
     uint32_t ts_bits;   // the queue family's timestamp bits (0: no timestamps)
     int _prof_pad;   // the device's subgroup size and its range; compute pipelines are pinned to 64 lanes (what the shaders are translated for: vk_spirv.py SUBGROUP)
     int mem_model, fp16;   // the Vulkan memory model and 16-bit float shaders turned on (what the Lossless frame generation shaders need)
+    int nonuniform;                      // shaderSampledImageArrayNonUniformIndexing is on (the draw path marks translated shaders' texture array accesses)
     int vi_dyn, null_desc, clip_ctl, idx_u8, border, divisor;   // extension features turned on: vertex input dynamic state, robustness2 nullDescriptor, depth clip control,
                                                                 // 8-bit indices, custom border colours, vertex attribute divisors
 } vk_ctx;
@@ -27,6 +28,8 @@ void vk_pool_add(const void *mem, uint64_t size);         // an NVN memory pool 
 void vk_pool_del(const void *mem);                        // back to ordinary pages, same bytes
 int vk_pool_find(uint64_t addr, uint64_t len, VkBuffer *buf, uint64_t *off);   // the pool buffer holding [addr, addr + len)
 void vk_pool_stats(int *n, uint64_t *bytes, int *failed);
+void vk_pool_churn(uint64_t *adds, uint64_t *add_b, uint64_t *dels, uint64_t *del_b);
+void vkx_defer_bytes(int64_t d);   // bytes of GPU memory whose free waits for the GPU (vkx_defer)
 // nvn_vk_exec.c: fn(arg) runs once the GPU has finished every submission that may still use what it frees (at once when the executor is off)
 void vkx_defer(void (*fn)(void *), void *arg);
 
