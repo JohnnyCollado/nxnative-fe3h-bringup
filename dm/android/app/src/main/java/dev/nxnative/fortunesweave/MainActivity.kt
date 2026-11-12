@@ -116,7 +116,7 @@ class MainActivity : Activity() {
             // with the game's art the status box moves up into the empty band under the logo's picture, so the three menu buttons end well above the hint line
             addView(statusBox, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply { topMargin = if (game) dp(-22) else dp(12) })
             // with the game's art: the menu alone scrolls, three buttons of one size showing at a time (each 50 high with 4 above and below); moving focus brings the next into view
-            if (game) addView(FocusBox(this@MainActivity).apply { addView(ScrollView(this@MainActivity).apply { isVerticalScrollBarEnabled = false; isVerticalFadingEdgeEnabled = true; setFadingEdgeLength(dp(14)); addView(grid) },
+            if (game) addView(FocusBox(this@MainActivity).apply { addView(ScrollView(this@MainActivity).apply { isFocusable = false; defaultFocusHighlightEnabled = false; isVerticalScrollBarEnabled = false; isVerticalFadingEdgeEnabled = true; setFadingEdgeLength(dp(14)); addView(grid) },
                 FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, dp(58 * 3))) }, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply { topMargin = dp(10) })
             else addView(FocusBox(this@MainActivity).apply { addView(grid) }, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply { topMargin = dp(10) })
         }
@@ -124,7 +124,7 @@ class MainActivity : Activity() {
             orientation = LinearLayout.HORIZONTAL
             setPadding(dp(28), dp(16), dp(28), dp(26))
             addView(if (game) LinearLayout(this@MainActivity).apply { orientation = LinearLayout.VERTICAL; gravity = Gravity.TOP; setPadding(0, dp(14), 0, 0); addView(left) }   // nothing else on the left scrolls
-                else ScrollView(this@MainActivity).apply { isFillViewport = true; isVerticalScrollBarEnabled = false
+                else ScrollView(this@MainActivity).apply { isFocusable = false; defaultFocusHighlightEnabled = false; isFillViewport = true; isVerticalScrollBarEnabled = false
                 addView(LinearLayout(this@MainActivity).apply { orientation = LinearLayout.VERTICAL; gravity = Gravity.CENTER_VERTICAL; addView(left) }) },
                 LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.MATCH_PARENT, 1f))
             addView(right, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.MATCH_PARENT, 1.05f).apply { marginStart = dp(30) })

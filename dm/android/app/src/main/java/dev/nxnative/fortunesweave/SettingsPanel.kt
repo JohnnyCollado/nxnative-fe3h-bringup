@@ -55,6 +55,7 @@ class SettingsPanel(context: Context, private val settings: Settings, private va
             addView(value, LayoutParams(0, LayoutParams.MATCH_PARENT, 1f).apply { marginStart = FeTheme.dp(context, 8) })
             setOnTouchListener { _, e -> if (e.action == MotionEvent.ACTION_DOWN) tapX = e.x; false }
             setOnClickListener {
+                if (!settings.active(c)) { tapX = -1f; return@setOnClickListener }   // greyed out: nothing to change
                 if (c.list) { tapX = -1f; pick(c); return@setOnClickListener }   // a list of the choices by their full names
                 if (tapX >= 0) { val back = tapX < width / 3f; tapX = -1f; change(c, if (back) -1 else 1) }   // touch: change at once
                 else { val was = edit; edit = if (was == c) null else c; was?.let { show(it) }; show(c); (parent as? View)?.let { notifyNav() } }   // controller: step in or out
@@ -90,7 +91,7 @@ class SettingsPanel(context: Context, private val settings: Settings, private va
     }
 
     private fun change(c: Settings.Choice, by: Int) {
-        val v = settings.step(c, by); settings[c] = v; show(c); onChange(c, v)
+        val v = settings.step(c, by); settings[c] = v; onChange(c, v); refresh()   // every row: another may depend on this one (Choice.needs)
     }
 
     private fun show(c: Settings.Choice) {
@@ -98,8 +99,8 @@ class SettingsPanel(context: Context, private val settings: Settings, private va
         val on = edit == c
         r.view.background = if (on) FeTheme.plaque(context, "rowsel") else FeTheme.states(context, "cream", "rowsel")
         FeTheme.plaquePadding(r.view)
-        val ink = if (on) FeTheme.BRIGHT else FeTheme.INK
-        r.name.setTextColor(ink); r.value.setTextColor(if (on) FeTheme.GOLD else ink)
+        val ink = if (!settings.active(c)) FeTheme.MUTED else if (on) FeTheme.BRIGHT else FeTheme.INK
+        r.name.setTextColor(ink); r.value.setTextColor(if (on && settings.active(c)) FeTheme.GOLD else ink)
         r.name.text = c.title + if (c.live) "" else " *"
         r.value.text = if (c.list) settings.label(c) + "  ▾" else if (on) "◀  " + settings.label(c) + "  ▶" else settings.label(c)
     }

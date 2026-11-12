@@ -192,7 +192,7 @@ class GameActivity : Activity(), SurfaceHolder.Callback {
         val columns = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             setPadding(dp(32), dp(18), dp(32), dp(26))
-            addView(ScrollView(this@GameActivity).apply { isFillViewport = true; isVerticalScrollBarEnabled = false
+            addView(ScrollView(this@GameActivity).apply { isFocusable = false; defaultFocusHighlightEnabled = false; isFillViewport = true; isVerticalScrollBarEnabled = false
                 addView(LinearLayout(this@GameActivity).apply { orientation = LinearLayout.VERTICAL; gravity = Gravity.CENTER_VERTICAL; addView(left) }) },
                 LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.MATCH_PARENT, 0.8f))
             addView(right, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.MATCH_PARENT, 1.2f).apply { marginStart = dp(34) })
@@ -205,6 +205,7 @@ class GameActivity : Activity(), SurfaceHolder.Callback {
             }
             visibility = View.GONE
             isClickable = true   // touches on the paused game do not reach it
+            isFocusable = false; defaultFocusHighlightEnabled = false   // clickable made it a focus target: the d-pad could land on it, and Android then highlighted the whole screen
             addView(columns)
             addView(hint, FrameLayout.LayoutParams(FrameLayout.LayoutParams.WRAP_CONTENT, FrameLayout.LayoutParams.WRAP_CONTENT, Gravity.BOTTOM or Gravity.START).apply { setMargins(dp(34), 0, 0, dp(6)) })
             viewTreeObserver.addOnGlobalFocusChangeListener { _, _ -> nav.update() }

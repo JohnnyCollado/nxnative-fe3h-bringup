@@ -2257,7 +2257,7 @@ static uint64_t g_n_dlss, g_n_dlss_st, g_n_dlss_fsr;
 // history less there. DM_FSR2_REACTIVE_T0 / _T1: the relative brightness change where the mask starts and where it is full (default 0.06, 0.2);
 // DM_FSR2_REACTIVE_MAX: its strongest value (default 0.9; 1 would drop the history entirely)
 static struct { VkPipeline p; VkPipelineLayout pl; VkDescriptorSetLayout dsl; VkImage img[3]; VkDeviceMemory mem[3]; VkImageView view[3]; uint32_t w, h; int cur, have_prev, state; } g_ra;
-static float g_ra_t0, g_ra_t1, g_ra_max, g_ra_decay;
+static float g_ra_t0, g_ra_t1, g_ra_max, g_ra_decay, g_ra_edge;
 static int ra_mem_type(uint32_t bits) {
     VkPhysicalDeviceMemoryProperties mp; vkGetPhysicalDeviceMemoryProperties(g_vk.pd, &mp);
     for (uint32_t i = 0; i < mp.memoryTypeCount; i++) if ((bits >> i & 1) && (mp.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) return (int)i;
@@ -2272,14 +2272,17 @@ static int ra_setup(void) {   // once: the switches, the format check and the pi
     e = getenv("DM_FSR2_REACTIVE_T1"); g_ra_t1 = e ? (float)atof(e) : 0.2f;
     e = getenv("DM_FSR2_REACTIVE_MAX"); g_ra_max = e ? (float)atof(e) : 0.9f;
     e = getenv("DM_FSR2_REACTIVE_DECAY"); g_ra_decay = e ? (float)atof(e) : 0.85f;   // the share of last frame's mask kept: about ten frames to fade
-    VkFormat need[2] = {VK_FORMAT_R8_UNORM, VK_FORMAT_R16_SFLOAT};
+    // DM_FSR2_REACTIVE_EDGE: the share of an edge's own 3x3 contrast a change must exceed to count (reactive.comp; 0: any change counts, as before). The camera's
+    // sub-pixel jitter moves a hard edge enough to change the 3x3 mean by up to a third of its contrast, and the mask fired on every still edge
+    e = getenv("DM_FSR2_REACTIVE_EDGE"); g_ra_edge = e ? (float)atof(e) : 0.0f;   // off: at 0.5 still edges still flickered and the turning gears were no longer marked (re/fsr/masksim.py)
+    VkFormat need[2] = {VK_FORMAT_R8_UNORM, VK_FORMAT_R16G16B16A16_SFLOAT};
     for (int i = 0; i < 2; i++) { VkFormatProperties fp; vkGetPhysicalDeviceFormatProperties(g_vk.pd, need[i], &fp);
         if (!(fp.optimalTilingFeatures & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT) || !(fp.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT)) { VLOG("[RED] DLSS: no reactive mask: format %d cannot be a storage image here", need[i]); return 0; } }
     if (!vkCmdPushDescriptorSetKHR) { VLOG("[RED] DLSS: no reactive mask: push descriptors are not available"); return 0; }
     VkDescriptorSetLayoutBinding b[5];
     for (uint32_t i = 0; i < 5; i++) b[i] = (VkDescriptorSetLayoutBinding){i, i < 3 ? VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER : VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL};
     VkDescriptorSetLayoutCreateInfo dli = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, NULL, VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR, 5, b};
-    VkPushConstantRange pr = {VK_SHADER_STAGE_COMPUTE_BIT, 0, 28};
+    VkPushConstantRange pr = {VK_SHADER_STAGE_COMPUTE_BIT, 0, 32};
     VkShaderModuleCreateInfo mi = {VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, NULL, 0, sizeof k_reactive_comp, k_reactive_comp};
     VkShaderModule m;
     if (vkCreateDescriptorSetLayout(g_vk.dev, &dli, NULL, &g_ra.dsl) || vkCreateShaderModule(g_vk.dev, &mi, NULL, &m)) { VLOG("[RED] DLSS: no reactive mask: its layout or shader failed"); return 0; }
@@ -2289,8 +2292,8 @@ static int ra_setup(void) {   // once: the switches, the format check and the pi
     int ok = !vkCreatePipelineLayout(g_vk.dev, &pli, NULL, &g_ra.pl) && (ci.layout = g_ra.pl, !vkCreateComputePipelines(g_vk.dev, VK_NULL_HANDLE, 1, &ci, NULL, &g_ra.p));
     vkDestroyShaderModule(g_vk.dev, m, NULL);
     if (!ok) { VLOG("[RED] DLSS: no reactive mask: its pipeline failed"); return 0; }
-    VLOG("DLSS: reactive mask on: brightness change from %.2f to %.2f of the pixel's level, up to %.2f, %.2f of it kept each next frame; also as the transparency and composition mask (DM_FSR2_REACTIVE, _T0, _T1, _MAX, _DECAY)",
-         g_ra_t0, g_ra_t1, g_ra_max, g_ra_decay);
+    VLOG("DLSS: reactive mask on: brightness change from %.2f to %.2f of the pixel's level, up to %.2f, %.2f of it kept each next frame; a change within %.2f of an edge's own contrast does not count; also as the transparency and composition mask (DM_FSR2_REACTIVE, _T0, _T1, _MAX, _DECAY, _EDGE)",
+         g_ra_t0, g_ra_t1, g_ra_max, g_ra_decay, g_ra_edge);
     g_ra.state = 1; return 1;
 }
 static int ra_images(VkCommandBuffer cb, uint32_t w, uint32_t h) {   // the mask and the two brightness histories at the render size
@@ -2298,7 +2301,7 @@ static int ra_images(VkCommandBuffer cb, uint32_t w, uint32_t h) {   // the mask
     if (g_ra.img[0]) { vkDeviceWaitIdle(g_vk.dev); for (int i = 0; i < 3; i++) { vkDestroyImageView(g_vk.dev, g_ra.view[i], NULL); vkDestroyImage(g_vk.dev, g_ra.img[i], NULL); vkFreeMemory(g_vk.dev, g_ra.mem[i], NULL); g_ra.img[i] = VK_NULL_HANDLE; } }
     VkImageMemoryBarrier ib[3];
     for (int i = 0; i < 3; i++) {
-        VkFormat f = i ? VK_FORMAT_R16_SFLOAT : VK_FORMAT_R8_UNORM;
+        VkFormat f = i ? VK_FORMAT_R16G16B16A16_SFLOAT : VK_FORMAT_R8_UNORM;   // the histories: blurred brightness and 3x3 contrast
         VkImageCreateInfo ii = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, NULL, 0, VK_IMAGE_TYPE_2D, f, {w, h, 1}, 1, 1, VK_SAMPLE_COUNT_1_BIT, VK_IMAGE_TILING_OPTIMAL,
                                 VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT, VK_SHARING_MODE_EXCLUSIVE, 0, NULL, VK_IMAGE_LAYOUT_UNDEFINED};
         if (vkCreateImage(g_vk.dev, &ii, NULL, &g_ra.img[i])) { g_ra.img[i] = VK_NULL_HANDLE; return 0; }
@@ -2324,7 +2327,7 @@ static void reactive_run(sub_t *s, fsr2_job *j) {
     VkWriteDescriptorSet w[5];
     for (uint32_t i = 0; i < 5; i++) w[i] = (VkWriteDescriptorSet){VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, VK_NULL_HANDLE, i, 0, 1,
                                                                  i < 3 ? VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER : VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &ii[i], NULL, NULL};
-    struct { int32_t w, h; float t0, t1, rmax; int32_t first; float decay; } pc = {(int32_t)j->iw, (int32_t)j->ih, g_ra_t0, g_ra_t1, g_ra_max, (j->reset || !g_ra.have_prev) ? 1 : 0, g_ra_decay};
+    struct { int32_t w, h; float t0, t1, rmax; int32_t first; float decay, edge; } pc = {(int32_t)j->iw, (int32_t)j->ih, g_ra_t0, g_ra_t1, g_ra_max, (j->reset || !g_ra.have_prev) ? 1 : 0, g_ra_decay, g_ra_edge};
     barrier_all(s->cb);   // last frame's FSR 2 read of the mask and this frame's draws of colour and motion
     vkCmdBindPipeline(s->cb, VK_PIPELINE_BIND_POINT_COMPUTE, g_ra.p);
     vkCmdPushDescriptorSetKHR(s->cb, VK_PIPELINE_BIND_POINT_COMPUTE, g_ra.pl, 0, 5, w);

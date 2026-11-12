@@ -50,7 +50,7 @@ class MenuNav(private val context: Context, private val settings: Settings, priv
         button?.isSelected = false; b.isSelected = true; button = b
         if (panel !== p) {
             right.removeAllViews()
-            right.addView(ScrollView(context).apply { isVerticalScrollBarEnabled = false; isFillViewport = true
+            right.addView(ScrollView(context).apply { isFocusable = false; defaultFocusHighlightEnabled = false; isVerticalScrollBarEnabled = false; isFillViewport = true
                 addView(LinearLayout(context).apply { orientation = LinearLayout.VERTICAL; gravity = Gravity.CENTER_VERTICAL
                     (p.parent as? ViewGroup)?.removeView(p); addView(p) }) })
             panel = p
